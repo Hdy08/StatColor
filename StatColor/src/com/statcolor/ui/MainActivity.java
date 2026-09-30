@@ -90,7 +90,6 @@ public class MainActivity extends Activity {
     private ImageView icDarkEdit, icLightEdit;
     private TextView tvDarkPreview, tvLightPreview;
     private LinearLayout rowDarkPalette, rowLightPalette;
-    private RadioButton rbAuto, rbDark, rbLight;
     private TextView tvLog;
 
     private boolean binding = false;
@@ -126,6 +125,7 @@ public class MainActivity extends Activity {
         mContent.setPadding(dp(20), dp(20), dp(20), dp(32));
         mScrollView.addView(mContent, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        applyEdgeToEdge();
 
         buildContentView();
         setContentView(mScrollView);
@@ -167,11 +167,6 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 0, 0, 0, dp(24)));
 
-        addSectionHeader(R.string.settings_mode_header);
-        mContent.addView(buildModeCard(), margins(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                0, 0, 0, dp(24)));
-
         Button save = new Button(this);
         save.setText(R.string.settings_save);
         save.setAllCaps(false);
@@ -183,29 +178,10 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 0, 0, 0, dp(4)));
 
-        Button diag = new Button(this);
-        diag.setText(R.string.settings_diag);
-        diag.setAllCaps(false);
-        diag.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { showDiag(); }
-        });
-        styleTextButton(diag);
-        mContent.addView(diag, margins(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                0, 0, 0, dp(20)));
-
         mContent.addView(buildLogCard(), margins(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 0, 0, 0, dp(16)));
 
-        TextView footer = new TextView(this);
-        footer.setText(R.string.settings_footer);
-        footer.setTextSize(12);
-        footer.setTextColor(themeColorList(android.R.attr.textColorSecondary));
-        footer.setLineSpacing(dp(3), 1f);
-        mContent.addView(footer, margins(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(4), 0, dp(4), 0));
     }
 
     /** 总开关卡片：标题 + 说明 + 右侧开关，整行可点。 */
@@ -258,6 +234,8 @@ public class MainActivity extends Activity {
         TextView previewView = new TextView(this);
         previewView.setTextSize(16);
         previewView.setPadding(dp(16), dp(14), dp(16), dp(14));
+        // 底色固定纯黑 / 纯白：这一条就是用来对照状态的，必须自己带背景
+        previewView.setBackground(innerSurface(isDarkGroup ? 0xFF000000 : 0xFFFFFFFF));
         if (isDarkGroup) tvDarkPreview = previewView; else tvLightPreview = previewView;
         card.addView(previewView, margins(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -346,42 +324,6 @@ public class MainActivity extends Activity {
                 0, 0, 0, 0));
 
         return card;
-    }
-
-    /** 颜色模式卡片：三选一。 */
-    private View buildModeCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(cardBackground());
-
-        rbAuto = addRadioRow(card, R.string.settings_mode_auto, false);
-        rbDark = addRadioRow(card, R.string.settings_mode_dark, true);
-        rbLight = addRadioRow(card, R.string.settings_mode_light, true);
-
-        View.OnClickListener l = new View.OnClickListener() {
-            @Override public void onClick(View v) { preview(); }
-        };
-        rbAuto.setOnClickListener(l);
-        rbDark.setOnClickListener(l);
-        rbLight.setOnClickListener(l);
-        return card;
-    }
-
-    private RadioButton addRadioRow(LinearLayout card, int textRes, boolean withDivider) {
-        if (withDivider) {
-            card.addView(divider(), margins(
-                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1) / 2),
-                    dp(ROW_PAD_H_DP), 0, dp(ROW_PAD_H_DP), 0));
-        }
-        RadioButton rb = new RadioButton(this);
-        rb.setText(textRes);
-        rb.setTextSize(15);
-        rb.setTextColor(themeColorList(android.R.attr.textColorPrimary));
-        rb.setPadding(dp(ROW_PAD_H_DP), dp(ROW_PAD_V_DP), dp(ROW_PAD_H_DP), dp(ROW_PAD_V_DP));
-        card.addView(rb, margins(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                0, 0, 0, 0));
-        return rb;
     }
 
     private View buildLogCard() {
@@ -646,18 +588,8 @@ public class MainActivity extends Activity {
         etDark.setText(sp.getString(Config.KEY_DARK, Config.DEFAULT_DARK));
         etLight.setText(sp.getString(Config.KEY_LIGHT, Config.DEFAULT_LIGHT));
 
-        String mode = sp.getString(Config.KEY_MODE, Config.MODE_AUTO);
-        if (Config.MODE_DARK.equals(mode)) rbDark.setChecked(true);
-        else if (Config.MODE_LIGHT.equals(mode)) rbLight.setChecked(true);
-        else rbAuto.setChecked(true);
         binding = false;
         preview();
-    }
-
-    private String currentMode() {
-        return rbDark.isChecked() ? Config.MODE_DARK
-                : rbLight.isChecked() ? Config.MODE_LIGHT
-                : Config.MODE_AUTO;
     }
 
     private void save() {
@@ -668,10 +600,10 @@ public class MainActivity extends Activity {
         e.putString(Config.KEY_LIGHT, Config.toHex(
                 Config.parseColor(etLight.getText().toString(), 0xFF000000)));
         e.putInt(Config.KEY_ALPHA, 100);   // 透明度过时字段，恒为 100
-        e.putString(Config.KEY_MODE, currentMode());
+        e.putString(Config.KEY_MODE, Config.MODE_AUTO);   // 颜色模式已移除，固定跟随系统
         e.commit();
 
-        appendLog("已保存：" + currentMode());
+        appendLog("已保存");
         Toast.makeText(this, R.string.settings_saved, Toast.LENGTH_SHORT).show();
         restartSystemUi();
     }
@@ -695,7 +627,7 @@ public class MainActivity extends Activity {
             sb.append(Config.KEY_LIGHT).append('=')
               .append(Config.toHex(Config.parseColor(etLight.getText().toString(), 0xFF000000)))
               .append('\n');
-            sb.append(Config.KEY_MODE).append('=').append(currentMode()).append('\n');
+            sb.append(Config.KEY_MODE).append('=').append(Config.MODE_AUTO).append('\n');
 
             File tmp = new File(getFilesDir(), "statcolor.conf");
             FileOutputStream fos = new FileOutputStream(tmp);
@@ -723,11 +655,19 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             @Override public void run() {
                 final String syncErr = syncConfFile();
+                // 每次应用后把配置文件读回来打出来，取代原来的「自诊断」按钮
+                final String dump = syncErr == null
+                        ? exec("su", "-c", "cat " + Hook.CONF_FILE) : null;
                 final String r = exec("su", "-c", "killall com.android.systemui");
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override public void run() {
-                        if (syncErr != null) appendLog("配置镜像同步失败 —— " + syncErr);
-                        else appendLog("配置已同步到 " + Hook.CONF_FILE);
+                        if (syncErr != null) {
+                            appendLog("配置同步失败 —— " + syncErr);
+                        } else {
+                            appendLog("配置已写入 " + Hook.CONF_FILE);
+                            appendLog(dump == null || dump.trim().isEmpty()
+                                    ? "(读不到内容)" : dump.trim());
+                        }
 
                         if (r == null || r.startsWith("__ERR__")) {
                             appendLog("自动重启失败，请手动重启手机。");
@@ -740,26 +680,6 @@ public class MainActivity extends Activity {
                 });
             }
         }).start();
-    }
-
-    /** 读回配置文件内容，用于自诊断。 */
-    private void showDiag() {
-        appendLog("──── 自诊断 ────");
-        appendLog("模块版本 " + Hook.VERSION + " · 配置文件 " + Hook.CONF_FILE);
-
-        String r = exec("su", "-c", "ls -l " + Hook.CONF_FILE);
-        if (r == null || r.startsWith("__ERR__") || r.indexOf("statcolor.conf") < 0) {
-            appendLog("✗ 配置文件不存在（Hook 将退回 SharedPreferences）");
-        } else {
-            appendLog("✓ " + r.trim());
-            String body = exec("su", "-c", "cat " + Hook.CONF_FILE);
-            appendLog("内容：\n" + (body == null ? "(读不到)" : body.trim()));
-        }
-
-        SharedPreferences sp = Config.prefs(this);
-        appendLog("SharedPreferences: enable="
-                + sp.getBoolean(Config.KEY_ENABLE, false)
-                + " mode=" + sp.getString(Config.KEY_MODE, "auto"));
     }
 
     private String exec(String... cmd) {
@@ -899,6 +819,23 @@ public class MainActivity extends Activity {
      * 少数 OEM 会在 decor 内部消费掉 insets，那样监听器收不到，用框架的
      * status_bar_height 兜底。
      */
+    /**
+     * 内容铺到系统栏之后，系统栏底色设为透明，于是状态栏那一条显示的就是
+     * 应用自己的窗口底色 —— 与页面连成一片。
+     *
+     * <p>之前不一致的原因：targetSdk 34 不会被强制全面屏，系统栏仍按主题里
+     * 的 statusBarColor 画一条不透明色带，而页面用的是 colorBackground，两者不同。
+     */
+    private void applyEdgeToEdge() {
+        try {
+            android.view.Window w = getWindow();
+            w.setDecorFitsSystemWindows(false);        // minSdk 31，必然可用
+            w.setStatusBarColor(Color.TRANSPARENT);    // targetSdk 34 下仍然有效
+            w.setNavigationBarColor(Color.TRANSPARENT);
+        } catch (Throwable ignored) {}
+        mScrollView.setBackgroundColor(themeColor(android.R.attr.colorBackground));
+    }
+
     private void applySystemBarInsets() {
         final int left = mContent.getPaddingLeft();
         final int top = mContent.getPaddingTop();
