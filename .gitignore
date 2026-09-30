@@ -1,0 +1,33 @@
+# ── 构建产物 ──
+build/
+*.apk
+*.apk.idsig
+*.dex
+*.jar
+*.class
+
+# ── 签名密钥（不入库；缺失时 build.sh 会自动生成一个）──
+statcolor.keystore
+
+# ── 逆向用的临时物（体积大且来自系统镜像，不应入库）──
+sdk/
+sysui/
+smali/
+__pycache__/
+
+# ── 调试日志抓取 ──
+log*.txt
+w*.txt
+t.txt
+
+# ── 逆向用的原生工具 / 早期试验脚本 / 解包校验物 ──
+aapt2.jar
+lib/
+verify/
+aapt2x/
+scratch/
+
+# ── 编辑器 ──
+*.swp
+.idea/
+.vscode/

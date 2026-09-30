@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="sc_bg">#FFF2F3F5</color>
+    <color name="sc_card">#FFFFFFFF</color>
+    <color name="sc_text">#FF1A1D21</color>
+    <color name="sc_text_dim">#FF6B7280</color>
+    <color name="sc_hint">#FFA0A7B3</color>
+    <color name="sc_radio">#FF374151</color>
+    <color name="sc_log">#FF1F7A55</color>
+    <color name="sc_swatch_stroke">#40000000</color>
+</resources>

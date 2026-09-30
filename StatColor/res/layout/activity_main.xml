@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/sc_bg"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <!-- 总开关 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:id="@+id/card_switch"
+            android:background="@color/sc_card"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="14dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="启用着色"
+                android:textColor="@color/sc_text"
+                android:textSize="16sp" />
+
+            <Switch
+                android:id="@+id/sw_enable"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content" />
+        </LinearLayout>
+
+        <!-- 深色背景时 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="深色背景"
+            android:textColor="@color/sc_text_dim"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:id="@+id/card_dark"
+            android:background="@color/sc_card"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/tv_dark_preview"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp"
+                android:background="#FF000000"
+                android:padding="12dp"
+                android:textSize="16sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <FrameLayout
+                    android:layout_width="56dp"
+                    android:layout_height="40dp">
+
+                    <TextView
+                        android:id="@+id/tv_dark_swatch"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="#FFFFFFFF"
+                        android:clickable="true"
+                        android:focusable="true" />
+
+                    <ImageView
+                        android:id="@+id/iv_dark_edit"
+                        android:layout_width="18dp"
+                        android:layout_height="18dp"
+                        android:layout_gravity="center"
+                        android:clickable="false"
+                        android:focusable="false"
+                        android:src="@drawable/ic_edit" />
+                </FrameLayout>
+
+                <EditText
+                    android:id="@+id/et_dark_hex"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="12dp"
+                    android:layout_weight="1"
+                    android:hint="#FFFFFFFF"
+                    android:inputType="text"
+                    android:textColor="@color/sc_text"
+                    android:textColorHint="@color/sc_hint"
+                    android:textSize="15sp" />
+
+                <Button
+                    android:id="@+id/btn_dark_default"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:minWidth="0dp"
+                    android:paddingLeft="12dp"
+                    android:paddingRight="12dp"
+                    android:text="恢复默认"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/ll_dark_palette"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+        </LinearLayout>
+
+        <!-- 浅色背景时 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="浅色背景"
+            android:textColor="@color/sc_text_dim"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:id="@+id/card_light"
+            android:background="@color/sc_card"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/tv_light_preview"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="12dp"
+                android:background="#FFFFFFFF"
+                android:padding="12dp"
+                android:textSize="16sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <FrameLayout
+                    android:layout_width="56dp"
+                    android:layout_height="40dp">
+
+                    <TextView
+                        android:id="@+id/tv_light_swatch"
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent"
+                        android:background="#FF000000"
+                        android:clickable="true"
+                        android:focusable="true" />
+
+                    <ImageView
+                        android:id="@+id/iv_light_edit"
+                        android:layout_width="18dp"
+                        android:layout_height="18dp"
+                        android:layout_gravity="center"
+                        android:clickable="false"
+                        android:focusable="false"
+                        android:src="@drawable/ic_edit" />
+                </FrameLayout>
+
+                <EditText
+                    android:id="@+id/et_light_hex"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="12dp"
+                    android:layout_weight="1"
+                    android:hint="#FF000000"
+                    android:inputType="text"
+                    android:textColor="@color/sc_text"
+                    android:textColorHint="@color/sc_hint"
+                    android:textSize="15sp" />
+
+                <Button
+                    android:id="@+id/btn_light_default"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginLeft="8dp"
+                    android:minWidth="0dp"
+                    android:paddingLeft="12dp"
+                    android:paddingRight="12dp"
+                    android:text="恢复默认"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/ll_light_palette"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+        </LinearLayout>
+
+        <!-- 手动指定明暗 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:id="@+id/card_mode"
+            android:background="@color/sc_card"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="使用哪一组颜色"
+                android:textColor="@color/sc_text"
+                android:textSize="15sp" />
+
+            <RadioGroup
+                android:id="@+id/rg_mode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/rb_auto"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="跟随系统（推荐）"
+                    android:textColor="@color/sc_radio" />
+
+                <RadioButton
+                    android:id="@+id/rb_dark"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="始终使用「深色背景时」的颜色"
+                    android:textColor="@color/sc_radio" />
+
+                <RadioButton
+                    android:id="@+id/rb_light"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="始终使用「浅色背景时」的颜色"
+                    android:textColor="@color/sc_radio" />
+            </RadioGroup>
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btn_save"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="保存并应用" />
+
+        <Button
+            android:id="@+id/btn_diag"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="自诊断（检查配置文件是否写出）" />
+
+        <TextView
+            android:id="@+id/tv_log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@color/sc_card"
+            android:padding="10dp"
+            android:textColor="@color/sc_log"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="修改后需重启 SystemUI 生效（保存按钮会尝试自动重启）。若颜色误设为透明导致看不清，在 LSPosed 里停用本模块并重启 SystemUI 即可恢复。"
+            android:textColor="@color/sc_text_dim"
+            android:textSize="11sp" />
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 预设色块上的对勾，运行时用 setId 挂上去 -->
+    <item name="tv_palette_check" type="id" />
+</resources>
