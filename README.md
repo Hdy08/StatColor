@@ -139,8 +139,9 @@ StatColor/
   src/com/statcolor/app/Hook.java        注入逻辑主体
   src/com/statcolor/app/Config.java      颜色解析 / 透明度 / pref 读写
   src/com/statcolor/app/Module.java      IXposedHookLoadPackage 入口
-  src/com/statcolor/ui/MainActivity.java 设置界面
-  res/                                   布局与资源（values / values-night 两套）
+  src/com/statcolor/ui/MainActivity.java 设置界面（纯 Java 构建，无 XML 布局）
+  res/values/strings.xml                 界面文案
+  res/drawable/ic_edit.xml               色块上的铅笔图标
   assets/xposed_init                     模块入口类名
   AndroidManifest.xml                    作用域、版本、主题
 stub/de/robv/android/xposed/             编译期 Xposed API 桩（不入 dex）
@@ -149,6 +150,23 @@ dexlist.py                               纯 Python 的 dex 类/方法列表工�
 DumpSmali.java / dumpsmali.sh            从 dex 抽出指定类的 smali
 FindRefs.java / findrefs.sh              扫描"谁引用了某个方法/字段"
 ```
+
+---
+
+## 界面
+
+设置界面**没有任何 XML 布局**，整屏在 `MainActivity` 里用框架控件搭出来，挂在
+`@android:style/Theme.DeviceDefault.DayNight` 上。这是与参考项目 **NativePowerMenu** 统一的 AOSP 设计语言：
+
+- 颜色一律从**框架主题属性**取，不硬编码、不打包 Material Components：
+  `colorBackgroundFloating`（卡片底）、`textColorPrimary` / `textColorSecondary`（文字）、`colorAccent`（强调色）
+- 卡片 18dp 圆角 + 半像素描边；行间 1px 分隔线（`textColorSecondary` at 0x1F）
+- 小标题 13sp、加粗、全大写、`letterSpacing 0.06`、强调色
+- 主按钮胶囊形（半径 = 高度/2，高 52dp），文字色按强调色亮度取反；次要操作是无底色文字按钮
+- 深浅色完全跟随系统，不需要 `values-night`
+- 标题栏在 `onCreate` 里显式隐藏（主题是 DayNight 而非 NoActionBar 变体）
+
+因此 minSdk 提到 **31**（`Theme.DeviceDefault.DayNight` 自 API 29 起才存在），targetSdk 34。
 
 ---
 

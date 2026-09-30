@@ -1,4 +1,40 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">状态栏着色</string>
+    <string name="module_description">统一修改 ColorOS / OxygenOS 状态栏上所有元素（时钟、网速、信号、WiFi、电量等）的颜色与透明度，通知图标与控制中心不受影响。</string>
+
+    <!-- 总开关 -->
+    <string name="settings_enable">启用着色</string>
+    <string name="settings_enable_desc">关闭后状态栏恢复系统默认</string>
+
+    <!-- 分组标题 -->
+    <string name="settings_dark_header">深色背景</string>
+    <string name="settings_light_header">浅色背景</string>
+    <string name="settings_mode_header">颜色模式</string>
+
+    <!-- 颜色行 -->
+    <string name="settings_reset">恢复默认</string>
+    <string name="settings_hex_hint_dark">#FFFFFFFF</string>
+    <string name="settings_hex_hint_light">#FF000000</string>
+    <string name="settings_pick_color">选择颜色</string>
+    <string name="settings_pick_dark_title">深色背景时的颜色</string>
+    <string name="settings_pick_light_title">浅色背景时的颜色</string>
+    <string name="settings_channel_alpha">不透明度 A</string>
+    <string name="settings_channel_red">红 R</string>
+    <string name="settings_channel_green">绿 G</string>
+    <string name="settings_channel_blue">蓝 B</string>
+    <string name="settings_ok">确定</string>
+    <string name="settings_cancel">取消</string>
+
+    <!-- 模式 -->
+    <string name="settings_mode_auto">跟随系统（推荐）</string>
+    <string name="settings_mode_dark">始终使用「深色背景」的颜色</string>
+    <string name="settings_mode_light">始终使用「浅色背景」的颜色</string>
+
+    <!-- 动作 -->
+    <string name="settings_save">保存并应用</string>
+    <string name="settings_diag">自诊断</string>
+    <string name="settings_saved">已保存，正在同步并重启系统界面…</string>
+    <string name="settings_restart_failed">请手动重启手机使配置生效</string>
+    <string name="settings_footer">修改后需重启 SystemUI 生效（保存按钮会尝试自动重启）。若颜色误设为全透明导致看不清，在 LSPosed 里停用本模块并重启 SystemUI 即可恢复。</string>
 </resources>

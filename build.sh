@@ -14,6 +14,8 @@ KS=$ROOT/statcolor.keystore
 KSPASS=statcolor
 VC=$(grep -oP 'android:versionCode="\K[0-9]+' "$PROJ/AndroidManifest.xml")
 VN=$(grep -oP 'android:versionName="\K[^"]+' "$PROJ/AndroidManifest.xml")
+MIN_SDK=$(grep -oP 'android:minSdkVersion="\K[0-9]+' "$PROJ/AndroidManifest.xml")
+TARGET_SDK=$(grep -oP 'android:targetSdkVersion="\K[0-9]+' "$PROJ/AndroidManifest.xml")
 APK=$ROOT/StatColor-$VN.apk
 echo "  目标: versionCode=$VC versionName=$VN -> $APK"
 
@@ -39,8 +41,8 @@ echo "=== [2/6] aapt2 link 资源 ==="
     -I "$ANDROID_JAR" \
     --manifest "$PROJ/AndroidManifest.xml" \
     --java "$OUT/gen" \
-    --min-sdk-version 24 \
-    --target-sdk-version 34 \
+    --min-sdk-version "$MIN_SDK" \
+    --target-sdk-version "$TARGET_SDK" \
     --version-code "$VC" --version-name "$VN" \
     "$OUT/res_compiled/res.zip"
 
@@ -67,7 +69,7 @@ echo "  stubs.jar  : $(unzip -l "$OUT/stubs.jar" | tail -1)"
 
 echo "=== [5/6] d8 转 dex ==="
 java -cp "$D8_JAR" com.android.tools.r8.D8 \
-    --min-api 24 \
+    --min-api "$MIN_SDK" \
     --lib "$ANDROID_JAR" \
     --classpath "$OUT/stubs.jar" \
     --output "$OUT/dex" \
