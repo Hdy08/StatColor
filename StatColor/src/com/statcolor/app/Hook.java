@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.1";
+    public static final String VERSION = "11.2";
 
     /** 配置镜像文件，由模块界面写出，权限 0644。 */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";

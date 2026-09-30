@@ -176,11 +176,12 @@ public class MainActivity extends Activity {
         stylePillButton(save);
         mContent.addView(save, margins(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                0, 0, 0, dp(4)));
+                0, 0, 0, dp(24)));
 
+        addSectionHeader(R.string.settings_log_header);
         mContent.addView(buildLogCard(), margins(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                0, 0, 0, dp(16)));
+                0, 0, 0, 0));
 
     }
 
