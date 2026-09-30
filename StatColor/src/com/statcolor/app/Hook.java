@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.2";
+    public static final String VERSION = "11.3";
 
     /** 配置镜像文件，由模块界面写出，权限 0644。 */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";
@@ -1796,20 +1796,15 @@ public final class Hook {
 
         if (verbose) {
             log("CALL#" + n + " orig=#" + Integer.toHexString(original)
-                    + " mode=" + c.mode + " dark=" + c.dark + " light=" + c.light
+                    + " dark=" + c.dark + " light=" + c.light
                     + " alpha=" + c.alpha);
         }
 
-        int base;
-        if (Config.MODE_DARK.equals(c.mode)) {
-            base = Config.parseColor(c.dark, 0xFFFFFFFF);
-        } else if (Config.MODE_LIGHT.equals(c.mode)) {
-            base = Config.parseColor(c.light, 0xFF000000);
-        } else {
-            base = luminance(original) > 0.5f
-                    ? Config.parseColor(c.dark, 0xFFFFFFFF)
-                    : Config.parseColor(c.light, 0xFF000000);
-        }
+        // 颜色模式已移除：一律按元素自身的明暗选组 —— 亮元素用「深色背景」那组，
+        // 暗元素用另一组。这是唯一的行为，不再有强制分组的开关。
+        int base = luminance(original) > 0.5f
+                ? Config.parseColor(c.dark, 0xFFFFFFFF)
+                : Config.parseColor(c.light, 0xFF000000);
 
         int out = Config.applyAlpha(base, c.alpha);
 
@@ -1839,7 +1834,7 @@ public final class Hook {
 
     private static final class Conf {
         boolean enable;
-        String dark, light, mode;
+        String dark, light;
         int alpha;
     }
 
@@ -1878,7 +1873,6 @@ public final class Hook {
         try {
             Conf c = new Conf();
             c.alpha = 100;
-            c.mode = Config.MODE_AUTO;
             c.dark = Config.DEFAULT_DARK;
             c.light = Config.DEFAULT_LIGHT;
 
@@ -1892,7 +1886,6 @@ public final class Hook {
                 if (Config.KEY_ENABLE.equals(k)) c.enable = "true".equalsIgnoreCase(v);
                 else if (Config.KEY_DARK.equals(k)) c.dark = v;
                 else if (Config.KEY_LIGHT.equals(k)) c.light = v;
-                else if (Config.KEY_MODE.equals(k)) c.mode = v;
                 else if (Config.KEY_ALPHA.equals(k)) {
                     try { c.alpha = Integer.parseInt(v); } catch (Throwable ignored) {}
                 }
@@ -1925,8 +1918,6 @@ public final class Hook {
                     .invoke(o, Config.KEY_DARK, Config.DEFAULT_DARK);
             c.light = (String) xsp.getMethod("getString", String.class, String.class)
                     .invoke(o, Config.KEY_LIGHT, Config.DEFAULT_LIGHT);
-            c.mode = (String) xsp.getMethod("getString", String.class, String.class)
-                    .invoke(o, Config.KEY_MODE, Config.MODE_AUTO);
             c.alpha = (Integer) xsp.getMethod("getInt", String.class, int.class)
                     .invoke(o, Config.KEY_ALPHA, 100);
             return c;
@@ -1944,7 +1935,6 @@ public final class Hook {
             if (!c.enable) return null;
             c.dark = sp.getString(Config.KEY_DARK, Config.DEFAULT_DARK);
             c.light = sp.getString(Config.KEY_LIGHT, Config.DEFAULT_LIGHT);
-            c.mode = sp.getString(Config.KEY_MODE, Config.MODE_AUTO);
             c.alpha = sp.getInt(Config.KEY_ALPHA, 100);
             return c;
         } catch (Throwable t) {

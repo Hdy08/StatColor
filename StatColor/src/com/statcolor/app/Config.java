@@ -19,14 +19,10 @@ public final class Config {
     public static final String KEY_DARK     = "color_dark";    // 深色背景时（浅色图标）
     public static final String KEY_LIGHT    = "color_light";   // 浅色背景时（深色图标）
     public static final String KEY_ALPHA    = "alpha";         // 0-100，全局透明度
-    public static final String KEY_MODE     = "mode";          // auto | dark | light
 
     public static final String DEFAULT_DARK  = "#FFFFFFFF";
     public static final String DEFAULT_LIGHT = "#FF000000";
 
-    public static final String MODE_AUTO  = "auto";
-    public static final String MODE_DARK  = "dark";
-    public static final String MODE_LIGHT = "light";
 
     private Config() {}
 

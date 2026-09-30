@@ -93,6 +93,11 @@ public class MainActivity extends Activity {
     private TextView tvLog;
 
     private boolean binding = false;
+
+    /** 日志正文。用 StringBuilder 记账，避免从 TextView 回读时带上多余换行。 */
+    private final StringBuilder mLog = new StringBuilder();
+    private final java.text.SimpleDateFormat logFmt =
+            new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault());
     private boolean mInsetsApplied = false;
 
     /** 预览条上的时间每秒走一格。 */
@@ -137,6 +142,7 @@ public class MainActivity extends Activity {
         loadIntoUi();
         syncSwatches();
         applySystemBarInsets();
+        reportModuleState();
     }
 
     @Override protected void onResume() {
@@ -601,7 +607,6 @@ public class MainActivity extends Activity {
         e.putString(Config.KEY_LIGHT, Config.toHex(
                 Config.parseColor(etLight.getText().toString(), 0xFF000000)));
         e.putInt(Config.KEY_ALPHA, 100);   // 透明度过时字段，恒为 100
-        e.putString(Config.KEY_MODE, Config.MODE_AUTO);   // 颜色模式已移除，固定跟随系统
         e.commit();
 
         appendLog("已保存");
@@ -628,7 +633,6 @@ public class MainActivity extends Activity {
             sb.append(Config.KEY_LIGHT).append('=')
               .append(Config.toHex(Config.parseColor(etLight.getText().toString(), 0xFF000000)))
               .append('\n');
-            sb.append(Config.KEY_MODE).append('=').append(Config.MODE_AUTO).append('\n');
 
             File tmp = new File(getFilesDir(), "statcolor.conf");
             FileOutputStream fos = new FileOutputStream(tmp);
@@ -703,9 +707,54 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 追加一行日志。
+     *
+     * <p>不再用 {@code tvLog.getText() + "\n" + s} 拼接 —— 那样第一条前面会多出一个
+     * 换行，日志首行是空的。改用 StringBuilder 记账，并且给**每一行**都加上时间戳
+     * （配置文件内容是多行的，逐行加才读得清）。
+     */
     private void appendLog(String s) {
-        if (tvLog == null) return;
-        tvLog.setText(tvLog.getText() + "\n" + s);
+        if (tvLog == null || s == null) return;
+        String[] lines = s.split("\n", -1);
+        for (String line : lines) {
+            if (mLog.length() > 0) mLog.append('\n');
+            mLog.append('[').append(logFmt.format(new java.util.Date())).append("] ").append(line);
+        }
+        tvLog.setText(mLog);
+    }
+
+    /**
+     * 启动时报告模块激活状态。
+     *
+     * <p>App 进程看不到 SystemUI 里有没有加载本模块，但 LSPosed 的日志里有 ——
+     * 每次注入都会留下 {@code StatColor: === vX.Y enter com.android.systemui}。
+     * 直接去捞最后一条，比让用户自己翻日志快得多。
+     */
+    private void reportModuleState() {
+        appendLog("模块版本 " + Hook.VERSION);
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final String out = exec("su", "-c",
+                        "grep -a 'StatColor: === v' /data/adb/lspd/log/modules_*.log | tail -n 1");
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override public void run() {
+                        if (out == null || out.startsWith("__ERR__")) {
+                            appendLog("无法读取 LSPosed 日志（" + out + "）");
+                            return;
+                        }
+                        String line = out.trim();
+                        if (line.isEmpty()) {
+                            appendLog("未找到激活记录 —— 请确认模块已启用、作用域勾选了"
+                                    + "「系统界面」，然后重启 SystemUI");
+                            return;
+                        }
+                        int i = line.indexOf("StatColor:");
+                        appendLog("模块已激活：" + (i >= 0 ? line.substring(i) : line));
+                    }
+                });
+            }
+        }).start();
     }
 
     // ─────────────────────────────────────────────────────── 主题与绘制
