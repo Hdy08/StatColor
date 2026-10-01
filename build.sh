@@ -4,13 +4,21 @@
 set -e
 set -o pipefail
 
-ROOT=/root/work/lsp
+# 脚本自身所在目录就是仓库根，换位置不用改脚本。
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 PROJ=$ROOT/StatColor
 OUT=$ROOT/build
-AAPT2=/usr/lib/android-sdk/build-tools/debian/aapt2
-ANDROID_JAR=$ROOT/sdk/platforms/android-34/android.jar
-D8_JAR=$ROOT/sdk/build-tools/34.0.0/lib/d8.jar
-KS=$ROOT/statcolor.keystore
+
+# 构建工具链不在仓库里，路径可用环境变量覆盖（与 NativePowerMenu 的做法一致）。
+SDK_DIR="${SDK_DIR:-/root/work/lsp/sdk}"
+AAPT2="${AAPT2:-/usr/lib/android-sdk/build-tools/debian/aapt2}"
+ANDROID_JAR="${ANDROID_JAR:-$SDK_DIR/platforms/android-34/android.jar}"
+D8_JAR="${D8_JAR:-$SDK_DIR/build-tools/34.0.0/lib/d8.jar}"
+KS="${KS:-$ROOT/statcolor.keystore}"
+
+for f in "$AAPT2" "$ANDROID_JAR" "$D8_JAR"; do
+    [ -e "$f" ] || { echo "FATAL: 缺少构建依赖 $f（可用环境变量覆盖路径）" >&2; exit 1; }
+done
 KSPASS=statcolor
 VC=$(grep -oP 'android:versionCode="\K[0-9]+' "$PROJ/AndroidManifest.xml")
 VN=$(grep -oP 'android:versionName="\K[^"]+' "$PROJ/AndroidManifest.xml")

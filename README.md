@@ -96,11 +96,37 @@ p3 → mCircleChargingPaint + circleFramePaint(30%) + 闪电
 - `aapt2`（本仓库使用 Debian 打包的原生 arm64 版本：`/usr/lib/android-sdk/build-tools/debian/aapt2`）
 - `apksigner`、`zipalign`、`keytool`
 
+**工具链不在仓库里**，路径通过环境变量覆盖，与 NativePowerMenu 的做法一致：
+
+```bash
+SDK_DIR=/path/to/sdk ./build.sh          # 一次性指定 SDK 根目录
+ANDROID_JAR=... D8_JAR=... AAPT2=... ./build.sh   # 或逐个覆盖
+```
+
+默认值：`SDK_DIR=/root/work/lsp/sdk`、`AAPT2=/usr/lib/android-sdk/build-tools/debian/aapt2`。
+依赖缺失时脚本会直接报 `FATAL: 缺少构建依赖 …` 并退出，不会产出一个半成品 APK。
+
 ### 命令
 
 ```bash
 ./build.sh
 ```
+
+脚本用自身所在目录作为仓库根，**换位置不需要改脚本**。
+
+### 在手机存储上使用
+
+仓库放在 `/sdcard/Code/StatColor`（与 NativePowerMenu 同目录）时有两处与普通文件系统不同，
+本仓库已经处理好：
+
+- `sdcardfs` 不保存 Unix 权限位，`./dumpsmali.sh` 这类脚本的可执行位会丢失。
+  仓库内已设 `core.fileMode=false`，git 不再把权限变化报成改动；
+  脚本用 `bash dumpsmali.sh` 调用即可。
+- 文件属主是手机用户（非容器内 root），git 会报 *dubious ownership*。需要：
+
+  ```bash
+  git config --global --add safe.directory /sdcard/Code/StatColor
+  ```
 
 产物为 `StatColor-<versionName>.apk`（版本号从 `StatColor/AndroidManifest.xml` 读取，避免手改两处不一致）。
 
