@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.3";
+    public static final String VERSION = "11.4";
 
     /** 配置镜像文件，由模块界面写出，权限 0644。 */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";
@@ -104,8 +104,10 @@ public final class Hook {
             hookDrawableTintSurvey(cl);
 
             log("=== v" + VERSION + " done " + pkg);
+            diag("loadPackage OK");
         } catch (Throwable t) {
             log("loadPackage FAILED: " + t);
+            diag("loadPackage FAILED " + t);
         }
     }
 
@@ -164,12 +166,41 @@ public final class Hook {
 
     private static void maybeSweep(View root) {
         long now = android.os.SystemClock.uptimeMillis();
+        reportBootDiag();                                 // 只打一次
         // 80ms 而不是 1s：布局变化（网速文字变长把左边图标挤动）时
         // 系统会重新给图标设一次白色 tint，1s 的节流就表现为
         // 「颜色暂时失效、稳定后才恢复」。配置已加缓存，这里跑得起。
         if (now - sLastSweepAt < 80) return;
         sLastSweepAt = now;
         try { sweep(root, 0); } catch (Throwable t) { logOnce("sweep err " + t); }
+    }
+
+    /**
+     * 装载期打的日志在 LSPosed 日志里基本收不到（那时 LSPosed 自己正在
+     * 疯狂刷 Portal 日志），所以把「挂上了哪些靶点」攒起来，
+     * 等第一次绘制状态栏时再补一条 —— 那条一定收得到。
+     */
+    private static final StringBuilder sBootDiag = new StringBuilder();
+    private static volatile boolean sBootDiagDone = false;
+
+    private static void diag(String s) {
+        synchronized (sBootDiag) {
+            if (sBootDiag.length() < 900) sBootDiag.append(s).append(" | ");
+        }
+    }
+
+    /** com.oplus...Foo → Foo，压缩诊断串长度。 */
+    private static String shortName(String cn) {
+        int i = cn.lastIndexOf('.');
+        return i < 0 ? cn : cn.substring(i + 1);
+    }
+
+    private static void reportBootDiag() {
+        if (sBootDiagDone) return;
+        sBootDiagDone = true;
+        String s;
+        synchronized (sBootDiag) { s = sBootDiag.toString(); }
+        log("=== v" + VERSION + " 靶点: " + s);
     }
 
     /**
@@ -215,7 +246,7 @@ public final class Hook {
             if (tl == null) return;
             int cur = tl.getDefaultColor();
             if (((cur >>> 24) & 0xFF) == 0) return;
-            Integer r = recolor(cur);
+            Integer r = tintArg(cur);
             if (r == null) return;
             int out = r.intValue();
             if (out == cur) return;
@@ -418,9 +449,8 @@ public final class Hook {
                         Object a0 = param.args[0];
                         if (!(a0 instanceof Integer)) return;
                         int cur = (Integer) a0;
-                        if (!isIconColor(cur)) return;      // 状态色（充电绿等）不动
-                        Integer r = recolor(cur);
-                        if (r == null || r.intValue() == cur) return;
+                        Integer r = tintArg(cur);           // 状态色只缩 alpha
+                        if (r == null) return;
                         param.args[0] = r;
                         logViewHit("reg-cf", self, cur, r);
                     } catch (Throwable ignored) {}
@@ -495,7 +525,7 @@ public final class Hook {
 
         for (String cn : batteryCls) {
             Class<?> c = findClass(cn, cl);
-            if (c == null) { log("MISS " + cn); continue; }
+            if (c == null) { log("MISS " + cn); diag(shortName(cn) + "=MISS"); continue; }
 
             // 1a) setColors 只「记账」，不当场改色。
             //     当场改色无法区分状态栏与控制中心（两者共用同一个类，
@@ -530,8 +560,10 @@ public final class Hook {
                         }
                     });
                     log("hooked " + c.getSimpleName() + "#draw(Canvas)");
+                    diag(shortName(cn) + "=ok");
                 } catch (NoSuchMethodException e) {
                     log("no draw(Canvas) in " + c.getSimpleName());
+                    diag(shortName(cn) + "=nodraw");
                 } catch (Throwable t) { log("hook draw fail: " + t); }
             }
         }
@@ -635,6 +667,9 @@ public final class Hook {
 
     private static final AtomicInteger BATT_REC = new AtomicInteger();
     private static final AtomicInteger BATT_DRAW = new AtomicInteger();
+    /** 每次进进程只打一条，用来确认电量钩子到底活着没有（限流日志已用满时也看得见）。 */
+    private static volatile boolean sBattFirst = false;
+    private static volatile boolean sBattFirstDraw = false;
 
     /** 只记账：把系统传进来的原始三个颜色存下来，绝不修改。 */
     private static void recordBatteryColors(Object inst, Object[] args) {
@@ -652,6 +687,13 @@ public final class Hook {
                         + " #" + Integer.toHexString(v[1])
                         + " #" + Integer.toHexString(v[2])
                         + " qs=" + isQsContext());
+            }
+            if (!sBattFirst) {
+                sBattFirst = true;                        // 进进程后的第一条，无条件打
+                log("[batt-first-rec] " + inst.getClass().getSimpleName()
+                        + " #" + Integer.toHexString(v[0])
+                        + " #" + Integer.toHexString(v[1])
+                        + " #" + Integer.toHexString(v[2]));
             }
         } catch (Throwable t) { logOnce("batt-rec err " + t); }
     }
@@ -693,6 +735,18 @@ public final class Hook {
                         + (wantTint ? " APPLY" : " RESTORE")
                         + " charging=" + charging
                         + " #" + Integer.toHexString(desired[0])
+                        + " #" + Integer.toHexString(desired[1])
+                        + " #" + Integer.toHexString(desired[2]));
+            }
+            if (!sBattFirstDraw) {
+                sBattFirstDraw = true;                    // 进进程后的第一条，无条件打
+                log("[batt-first-draw] " + inst.getClass().getSimpleName()
+                        + (wantTint ? " APPLY" : " RESTORE")
+                        + " charging=" + charging
+                        + " orig #" + Integer.toHexString(orig[0])
+                        + " #" + Integer.toHexString(orig[1])
+                        + " #" + Integer.toHexString(orig[2])
+                        + " -> #" + Integer.toHexString(desired[0])
                         + " #" + Integer.toHexString(desired[1])
                         + " #" + Integer.toHexString(desired[2]));
             }
@@ -816,6 +870,10 @@ public final class Hook {
      * 直接取 chargingDrawable 字段，在实例本身上调。
      */
     private static void tintChargeBolt(Object inst) {
+        // 闪电的颜色由这里直接决定（不透明色相 + Drawable#setAlpha），
+        // 别再让 tintArg() 去缩一次 alpha。
+        if (Boolean.TRUE.equals(BATT_APPLYING.get())) return;
+        BATT_APPLYING.set(Boolean.TRUE);
         try {
             Class<?> c = inst.getClass();
             java.lang.reflect.Field f = BATT_BOLT_F.get(c);
@@ -890,6 +948,7 @@ public final class Hook {
                 }
             }
         } catch (Throwable t) { logOnce("bolt err " + t); }
+        finally { BATT_APPLYING.remove(); }
     }
 
     private static final AtomicInteger BATT_BOLT_LOG = new AtomicInteger();
@@ -900,9 +959,14 @@ public final class Hook {
      *   p2 → mCircleBackPaint   底环（30% 白）
      *   p3 → mCircleChargingPaint + circleFramePaint(30%) + 闪电(90%)
      *
-     * 所以：**系统状态色（充电绿/低电量红）保留色相**，只按全局透明度缩放；
+     * 所以：**系统状态色（充电绿/低电量红/省电黄）保留色相**，只按全局透明度缩放；
      * 中性白才换成主题色。透明度按「元素原 alpha × 配置 alpha / 255」缩放，
      * 相对层次（底环 30% < 电量环 80%）不会被抹平。
+     *
+     * v11.4：判据从 `charging && 是状态色` 收紧成「只要本身是状态色」。
+     * 低电量红是**未充电时**出现的，原来全靠 batteryIsCharging() 里的
+     * 饱和色兜底才走到这条分支 —— 那层兜底一旦判错，红色就被换成主题色。
+     * 现在直接看颜色本身，与充电与否无关：红色永远只改 alpha。
      */
     private static int[] tintOf(int[] orig, boolean charging) {
         int[] out = new int[3];
@@ -914,8 +978,8 @@ public final class Hook {
             if (r == null) { out[i] = cur; continue; }
             int theme = r.intValue();
             int cfgA = (theme >>> 24) & 0xFF;
-            if (charging && isSystemStatusColor(cur)) {
-                // 随电量变化的那一份：保留系统色相（充电绿），只改 alpha
+            if (isSystemStatusColor(cur)) {
+                // 系统状态色（充电绿 / 低电量红 / 省电黄）：保留色相，只改 alpha
                 out[i] = (cur & 0x00FFFFFF) | (scaleAlphaBy(a, cfgA) << 24);
             } else {
                 // 自定义 RGB + 按原相对 alpha 缩放。
@@ -1252,23 +1316,21 @@ public final class Hook {
                                     + " gray=" + isIconColor(orig));
                         }
 
-                        // 只改「中性色」（R=G=B 且够亮）。
+                        // 只改「中性色」（R=G=B 且够亮）与「系统状态色」（只缩 alpha）。
                         //
                         // v7.1 曾放宽成「亮度下限」，理由是以为信号/WiFi 走这条路。
                         // 后来反编译证明它们走 ImageView tint（现由视图树扫描处理），
                         // 放宽反而出问题：电量图标在充电时会被系统把画笔设成
                         // 绿色 #ff24b232，那条路把绿色也当成"图标色"改成了主题红，
                         // 于是「充电时保持系统绿环」永远被覆盖掉。
-                        // 实测状态栏绘制期间出现的颜色只有 #ccffffff(文字) 和
-                        // #ff24b232(电量绿)，收紧到中性色即可两全。
-                        if (!isIconColor(orig)) return;
+                        // v11.4 起交给 tintArg()：绿色只缩 alpha、不改色相，
+                        // 既保住系统绿，又能让「充电时 alpha 受自定义颜色控制」成立。
+                        // 实测状态栏绘制期间出现的颜色只有 #ccffffff(文字)、
+                        // #ff24b232(充电绿) 和低电量时的红色。
+                        Integer out = tintArg(orig);
+                        if (out == null) return;
 
-                        Integer r = recolor(orig);
-                        if (r == null) return;
-
-                        // 直接用配置的颜色（含它自带的 alpha）
-                        int out = r.intValue();
-                        param.args[0] = Integer.valueOf(out);
+                        param.args[0] = out;
                         int n = PAINT_HITS.incrementAndGet();
                         if (n <= 20) log("[sb-paint] #" + Integer.toHexString(orig)
                                 + " -> #" + Integer.toHexString(out));
@@ -1330,12 +1392,62 @@ public final class Hook {
         return lum >= 0x60;                      // 太暗的放过（多为背景）
     }
 
-    /** 灰阶且亮 —— 系统浅色图标所用色域。 */    /** 灰阶且亮 —— 系统浅色图标所用色域。 */
+    /** 灰阶且亮 —— 系统浅色图标所用色域。 */
     private static boolean isIconColor(int c) {
         int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
         if (r != g || g != b) return false;
         if (r < 0x99) return false;
         return ((c >>> 24) & 0xFF) >= 0x60;
+    }
+
+    // ─────────────────────────────── 颜色参数的统一结论（v11.4）
+
+    /**
+     * Drawable#setTint(int) 内部会再调 setTintList(...)。
+     * 两个钩子都会看到同一次「逻辑上的一次调用」，
+     * 不加这个标记就会把同一个颜色缩放两次（alpha 越缩越小）。
+     */
+    private static final ThreadLocal<Boolean> TINT_CHAIN = new ThreadLocal<Boolean>();
+
+    /**
+     * 状态栏里一个颜色参数该变成什么。返回 null = 不改。
+     *
+     * 三条规矩（v11.4 统一，之前各条通道各写各的，漏了状态色）：
+     *
+     *   1) 中性色（R=G=B 且够亮）—— 系统给浅色图标准备的白/灰 ——
+     *      换成整套自定义色（RGB + 配置 alpha）。
+     *
+     *   2) 系统状态色（低电量红 / 充电绿 / 省电黄）——
+     *      **保留色相，只按配置 alpha 缩放**。
+     *      这是用户定的边界：「随电量变化的部分在充电时仅 alpha 受自定义颜色
+     *      控制，rgb 是系统默认」。低电量红同理 —— 红不能变成主题色，
+     *      但透明度必须跟着设置走。
+     *
+     *      v11.4 之前这里直接 return（`if (!isIconColor(cur)) return;`），
+     *      于是电量图标里那块红色永远停在系统 alpha 上：用户把透明度调到
+     *      50%，图标其它部分都淡下去了，只有红色那块还是实心的。
+     *      （横向/竖向电量的「随电量变化的那一份」就是这条通道刷上去的。）
+     *
+     *   3) 其余（暗色、通知图标色、彩色小图标）—— 一律不碰。
+     */
+    private static Integer tintArg(int cur) {
+        // 我们自己 invokeSetColors() 引发的 setColor/setTint 一律不管：
+        // tintOf() 已经把该套的 alpha 套好了，再缩一次就成了「平方」——
+        // 表现是透明度比设置的还要淡很多。
+        if (Boolean.TRUE.equals(BATT_APPLYING.get())) return null;
+        if (((cur >>> 24) & 0xFF) == 0) return null;      // 全透明占位
+        if (isIconColor(cur)) {
+            Integer r = recolor(cur);
+            return (r == null || r.intValue() == cur) ? null : r;
+        }
+        if (!isSystemStatusColor(cur)) return null;       // 不是状态色，不动
+        Integer r = recolor(cur);
+        if (r == null) return null;                       // 模块关着 / 读不到配置
+        if (r.intValue() == cur) return null;             // 已经是配置色本身
+        int a = (cur >>> 24) & 0xFF;
+        int na = scaleAlphaBy(a, (r.intValue() >>> 24) & 0xFF);
+        if (na == a) return null;                         // 配置不透明，无需改
+        return Integer.valueOf((cur & 0x00FFFFFF) | (na << 24));
     }
 
     // ───────── 系统图标（信号/WiFi/电池）——按位置与通知图标区分
@@ -1369,8 +1481,8 @@ public final class Hook {
                         Object o = param.args[0];
                         if (o == null) return;
                         int cur = (Integer) o.getClass().getMethod("getDefaultColor").invoke(o);
-                        Integer r = recolor(cur);
-                        if (r == null || r.intValue() == cur) return;
+                        Integer r = tintArg(cur);
+                        if (r == null) return;
 
                         java.lang.reflect.Constructor<?> ctor =
                                 o.getClass().getDeclaredConstructor(int.class);
@@ -1400,10 +1512,9 @@ public final class Hook {
                         Object a0 = param.args[0];
                         if (!(a0 instanceof Integer)) return;
                         int cur = (Integer) a0;
-                        if (!isIconColor(cur)) return;      // 状态色（充电绿等）不动
-                        Integer r = recolor(cur);
-                        if (r == null || r.intValue() == cur) return;
-                        param.args[0] = r;
+                        Integer out = tintArg(cur);
+                        if (out == null) return;
+                        param.args[0] = out;
                         scheduleRecolorAfterLayout(v);
                     } catch (Throwable ignored) {}
                 }
@@ -1450,8 +1561,8 @@ public final class Hook {
             Object tl = d.getClass().getMethod("getTintList").invoke(d);
             if (tl == null) return;
             int cur = (Integer) tl.getClass().getMethod("getDefaultColor").invoke(tl);
-            Integer r = recolor(cur);
-            if (r == null || r.intValue() == cur) return;
+            Integer r = tintArg(cur);
+            if (r == null) return;
             java.lang.reflect.Constructor<?> ctor = tl.getClass().getDeclaredConstructor(int.class);
             ctor.setAccessible(true);
             Object newTl = ctor.newInstance(r.intValue());
@@ -1506,17 +1617,16 @@ public final class Hook {
             Object a = param.args[idx];
             if (!(a instanceof Integer)) return;
             int cur = (Integer) a;
-            // 只改中性色，与 Paint#setColor 同一条规矩：
-            // 横向/竖向电量充电时是**在绘制过程中**用 Drawable#setTint
-            // 把绿色刷上去的，这里若无过滤就会把绿色改成自定义色
-            // （表现：要隐藏再显示状态栏才恢复 —— 那是走了另一条时序）。
-            if (!isIconColor(cur)) return;
-            Integer r = recolor(cur);
-            if (r == null || r.intValue() == cur) return;
-            param.args[idx] = r;
+            // 规矩见 tintArg()：中性色换整套自定义色；
+            // 系统状态色（低电量红、充电绿）只改 alpha，色相保持 ——
+            // 横向/竖向电量的进度色就是**在绘制过程中**用 Drawable#setTint
+            // 刷上去的，不认状态色的话那块红永远不吃自定义透明度。
+            Integer out = tintArg(cur);
+            if (out == null) return;
+            param.args[idx] = out;
             if (TINT_HITS.incrementAndGet() <= 20) {
                 log(tag + " #" + Integer.toHexString(cur)
-                        + " -> #" + Integer.toHexString(r));
+                        + " -> #" + Integer.toHexString(out));
             }
         } catch (Throwable ignored) {}
     }
@@ -1558,7 +1668,7 @@ public final class Hook {
                             int c0 = (Integer) o0.getClass()
                                     .getMethod("getDefaultColor").invoke(o0);
                             if (((c0 >>> 24) & 0xFF) == 0) return;
-                            Integer r0 = recolor(c0);
+                            Integer r0 = tintArg(c0);
                             if (r0 == null) return;
                             if (r0.intValue() != c0) {
                                 param.args[0] = newCsl(o0, r0.intValue());
@@ -1601,13 +1711,12 @@ public final class Hook {
                         Object a0 = param.args[0];
                         if (!(a0 instanceof Integer)) return;
                         int cur = (Integer) a0;
-                        if (!isIconColor(cur)) return;      // 状态色（充电绿等）不动
-                        Integer r = recolor(cur);
-                        if (r == null || r.intValue() == cur) return;
-                        param.args[0] = r;
+                        Integer out = tintArg(cur);
+                        if (out == null) return;
+                        param.args[0] = out;
                         if (TINT_HITS.incrementAndGet() <= 20) {
                             log("[sb-cf] #" + Integer.toHexString(cur)
-                                    + " -> #" + Integer.toHexString(r));
+                                    + " -> #" + Integer.toHexString(out));
                         }
                     } catch (Throwable ignored) {}
                 }
@@ -1621,7 +1730,13 @@ public final class Hook {
                 final java.lang.reflect.Method setTint = drawableCls.getDeclaredMethod("setTint", int.class);
                 XposedBridge.hookMethod(setTint, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
+                        // setTint(int) 内部会调 setTintList(...)，先立标记再放行，
+                        // 让下面那个钩子跳过这一次，避免同一颜色被缩放两次。
+                        TINT_CHAIN.set(Boolean.TRUE);
                         replaceIntArgInStatusBar(param, 0, "[sb-drw]");
+                    }
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        TINT_CHAIN.remove();
                     }
                 });
                 log("hooked Drawable#setTint");
@@ -1633,18 +1748,18 @@ public final class Hook {
                 XposedBridge.hookMethod(setTintList, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
                         try {
+                            if (Boolean.TRUE.equals(TINT_CHAIN.get())) return;  // 已由 setTint 处理
                             Boolean inSb = IN_STATUS_BAR.get();
                             if (inSb == null || !inSb) return;
                             Object o = param.args[0];
                             if (o == null) return;
                             int cur = (Integer) o.getClass().getMethod("getDefaultColor").invoke(o);
-                            if (!isIconColor(cur)) return;      // 状态色不动
-                            Integer r = recolor(cur);
-                            if (r == null || r.intValue() == cur) return;
-                            param.args[0] = newCsl(o, r.intValue());   // 工厂方法；构造函数不存在
+                            Integer out = tintArg(cur);
+                            if (out == null) return;
+                            param.args[0] = newCsl(o, out.intValue());   // 工厂方法；构造函数不存在
                             if (TINT_HITS.incrementAndGet() <= 20) {
                                 log("[sb-drw-csl] #" + Integer.toHexString(cur)
-                                        + " -> #" + Integer.toHexString(r));
+                                        + " -> #" + Integer.toHexString(out));
                             }
                         } catch (Throwable ignored) {}
                     }
