@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.4";
+    public static final String VERSION = "11.4.1";
 
     /** 配置镜像文件，由模块界面写出，权限 0644。 */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";
@@ -967,8 +967,20 @@ public final class Hook {
      * 低电量红是**未充电时**出现的，原来全靠 batteryIsCharging() 里的
      * 饱和色兜底才走到这条分支 —— 那层兜底一旦判错，红色就被换成主题色。
      * 现在直接看颜色本身，与充电与否无关：红色永远只改 alpha。
+     *
+     * v11.4.1：状态色用多大的透明度，**不能问它自己**。
+     * 实测（电量 19%，orig = #ffeb493d / #4dffffff / #ccffffff）：
+     *   p2 #4dffffff → #26ffffff、p3 #ccffffff → #65ffffff 都缩了，
+     *   只有 p1 #ffeb493d 一动不动。原因：低电量红亮度只有 0.42，
+     *   recolor() 按元素自身亮度选组 → 判成「深色元素」→ 选到
+     *   「浅色背景」那一组（这里是 #FF000000，不透明的），
+     *   算出来的 alpha 系数就是 255，缩放等于没做。
+     * 正解：透明度跟着**同一支 drawable 里的中性色**（底环 / 边框）走 ——
+     * 它们才是「状态栏现在这个透明度」的真实来源，而且自动跟着深浅模式变。
      */
     private static int[] tintOf(int[] orig, boolean charging) {
+        int statusA = statusBarAlpha(orig);       // 同一支 drawable 里中性色用的透明度
+
         int[] out = new int[3];
         for (int i = 0; i < 3; i++) {
             int cur = orig[i];
@@ -977,10 +989,9 @@ public final class Hook {
             Integer r = recolor(cur);
             if (r == null) { out[i] = cur; continue; }
             int theme = r.intValue();
-            int cfgA = (theme >>> 24) & 0xFF;
             if (isSystemStatusColor(cur)) {
                 // 系统状态色（充电绿 / 低电量红 / 省电黄）：保留色相，只改 alpha
-                out[i] = (cur & 0x00FFFFFF) | (scaleAlphaBy(a, cfgA) << 24);
+                out[i] = (cur & 0x00FFFFFF) | (scaleAlphaBy(a, statusA) << 24);
             } else {
                 // 自定义 RGB + 按原相对 alpha 缩放。
                 //
@@ -988,11 +999,33 @@ public final class Hook {
                 // 就编码在 p1 的 alpha 里（实测 #f0ffffff / #b5ffffff 随电量变），
                 // 背景与边框也各自带 0x4d 之类的层次。统一成配置 alpha 会把
                 // 它们抹平成同一个亮度 —— 表现就是「图标始终填满」。
+                int cfgA = (theme >>> 24) & 0xFF;
                 out[i] = (theme & 0x00FFFFFF) | (scaleAlphaBy(a, cfgA) << 24);
+                sSbAlpha = cfgA;                             // 记下状态栏当前的透明度
             }
         }
         return out;
     }
+
+    /**
+     * 这一组电量颜色里，状态栏正在用的透明度 —— 取自中性色（底环 / 边框 / 闪电底）。
+     * 全是状态色（理论上不会）时退回最近一次记住的值，再退回「深色背景」那组。
+     */
+    private static int statusBarAlpha(int[] orig) {
+        for (int i = 0; i < orig.length; i++) {
+            if (((orig[i] >>> 24) & 0xFF) == 0) continue;
+            if (isSystemStatusColor(orig[i])) continue;
+            Integer r = recolor(orig[i]);
+            if (r != null) return (r.intValue() >>> 24) & 0xFF;
+        }
+        return sSbAlpha >= 0 ? sSbAlpha : configAlpha();
+    }
+
+    /**
+     * 状态栏最近一次给中性元素算出的透明度。
+     * 状态色（低电量红 / 充电绿）没有自己的「组」可依据，就跟着它走。
+     */
+    private static volatile int sSbAlpha = -1;
 
     /** 元素原 alpha × 配置 alpha / 255。配置不透明(255)时原样保留。 */
     private static int scaleAlpha(int origAlpha, int themeColor) {
@@ -1438,14 +1471,20 @@ public final class Hook {
         if (((cur >>> 24) & 0xFF) == 0) return null;      // 全透明占位
         if (isIconColor(cur)) {
             Integer r = recolor(cur);
-            return (r == null || r.intValue() == cur) ? null : r;
+            if (r == null || r.intValue() == cur) return null;
+            sSbAlpha = (r.intValue() >>> 24) & 0xFF;      // 记下状态栏当前的透明度
+            return r;
         }
         if (!isSystemStatusColor(cur)) return null;       // 不是状态色，不动
         Integer r = recolor(cur);
         if (r == null) return null;                       // 模块关着 / 读不到配置
         if (r.intValue() == cur) return null;             // 已经是配置色本身
+        // 状态色没有自己的「组」可依据（低电量红亮度只有 0.42，按亮度选组会落到
+        // 不透明的浅色组 → alpha 系数 255 → 缩放等于没做，v11.4 实测）。
+        // 跟着状态栏最近一次给中性元素算出的透明度走。
+        int cfgA = sSbAlpha >= 0 ? sSbAlpha : configAlpha();
         int a = (cur >>> 24) & 0xFF;
-        int na = scaleAlphaBy(a, (r.intValue() >>> 24) & 0xFF);
+        int na = scaleAlphaBy(a, cfgA);
         if (na == a) return null;                         // 配置不透明，无需改
         return Integer.valueOf((cur & 0x00FFFFFF) | (na << 24));
     }
