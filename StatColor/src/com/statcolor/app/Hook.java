@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.4.2";
+    public static final String VERSION = "11.4.3";
 
     /** 配置镜像文件，由模块界面写出，权限 0644。 */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";
@@ -682,6 +682,9 @@ public final class Hook {
             BATT_ORIG.put(inst, v);
             // 系统重新下发颜色 = 我们之前的改动已被覆盖，下次绘制要重新套用
             BATT_APPLIED.remove(inst);
+            // setColors 会把闪电 tint 重设成 argb(0xe6,p3)（圆环那支），
+            // 等于系统自己擦掉了我们的着色 —— 标记一并清掉，状态栏那边好重上。
+            BOLT_TINTED.remove(inst);
             if (BATT_REC.incrementAndGet() <= 24) {
                 log("[batt-rec] " + inst.getClass().getSimpleName()
                         + " #" + Integer.toHexString(v[0])
@@ -707,7 +710,12 @@ public final class Hook {
         try {
             if (inst == null) return;
             int[] orig = BATT_ORIG.get(inst);
-            if (orig == null) return;                       // 还没记过账，不动
+            if (orig == null) {
+                // 还没记过账（换电池样式后会新建 drawable 实例）。
+                // 下拉面板这边照样要保证是系统默认 —— 见 restoreChargeBolt。
+                if (!wantTint) restoreChargeBolt(inst);
+                return;
+            }
 
             // 用户明确的边界（v8.9）：
             //   固定部分（背景 / 边框 / 闪电）→ RGBA 始终由自定义颜色控制
@@ -777,24 +785,24 @@ public final class Hook {
         restoreChargeBolt(inst);
     }
 
-    /** 取 chargingDrawable，取不到返回 null（同时缓存「没有这个字段」）。 */
+    /** 取 chargingDrawable，取不到返回 null（「没有这个字段」也缓存，别每帧重搜）。 */
     private static Object boltDrawable(Object inst) {
         try {
             Class<?> c = inst.getClass();
             java.lang.reflect.Field f = BATT_BOLT_F.get(c);
-            if (f == null) {
+            if (f == null && !BATT_BOLT_F.containsKey(c)) {
                 for (Class<?> k = c; k != null && f == null; k = k.getSuperclass()) {
                     try { f = k.getDeclaredField("chargingDrawable"); } catch (Throwable ignored) {}
                 }
                 if (f == null) {
                     BATT_BOLT_F.put(c, null);
                     if (BATT_BOLT_MISS.incrementAndGet() <= 3) logOnce("no chargingDrawable field");
-                    return null;
+                } else {
+                    f.setAccessible(true);
+                    BATT_BOLT_F.put(c, f);
                 }
-                f.setAccessible(true);
-                BATT_BOLT_F.put(c, f);
             }
-            return f.get(inst);
+            return f == null ? null : f.get(inst);
         } catch (Throwable t) { return null; }
     }
 
@@ -802,44 +810,99 @@ public final class Hook {
 
     /**
      * 把闪电写回系统默认：
-     *   色相 → setColors() 每帧都会重设成 argb(0xe6, p3)，这里补一次保险；
-     *          p3 取我们记下的原始值。
-     *   alpha → 系统从不碰 Drawable#setAlpha，默认就是 255。
+     *   色相 → argb(0xe6, p3)，p3 取我们记下的原始值（系统 setColors 用的就是它）；
+     *   alpha → 系统从不碰 Drawable#setAlpha，默认就是 255；
      *   横/竖电量的闪电是 Bitmap，颜色走 chargePaint 的 ColorFilter，撤掉。
+     *
+     * 两种形态**必须分开处理**，不能互相依赖：
+     *   ① 圆环 / 横向：chargingDrawable 的 tint → argb(0xe6, p3)、alpha → 255
+     *   ② 竖向（横向也有）：闪电是 Bitmap，用 chargePaint 画，
+     *      颜色来自 PorterDuffColorFilter → 撤掉
+     * 竖向电量根本没有 chargingDrawable 字段（它在 BatteryBarDrawableBase 上，
+     * 只有 chargePaint + chargingBitmap），所以「取不到 chargingDrawable 就
+     * return」会让竖/横向的闪电既上不了色、也还原不了。
+     *
+     * 用 BOLT_CLEAN 记账把每帧的开销压到「只在状态栏给它上过色之后做一次」。
+     * 不能用 Drawable#getTintList() 去读现值 —— 那个方法不是公开 API
+     * （android-34 的 android.jar 里就没有），getMethod 直接抛
+     * NoSuchMethodException。v11.4.2 就是这么整个失效的：initBoltRefs()
+     * 第一行挂在 getTintList 上，后面 mutate/setAlpha 全部没解析到，
+     * 结果两道防线同时哑火。
      */
     private static void restoreChargeBolt(Object inst) {
-        if (M_D_GET_TINT_LIST == null) return;            // 反射句柄没拿到，什么都不做
+        if (Boolean.TRUE.equals(BOLT_CLEAN.get(inst))) return;   // 已经是系统默认，别每帧重写
         try {
-            Object d = boltDrawable(inst);
-            if (d == null) return;
+            boolean touched = false;
             int[] orig = BATT_ORIG.get(inst);
-            int want = argbE6(orig != null ? orig[2] : 0xFFFFFFFF);
+            int def = argbE6(orig != null ? orig[2] : 0xFFFFFFFF);
 
-            Object tl = M_D_GET_TINT_LIST.invoke(d);
-            int cur = tl == null ? 0
-                    : ((Integer) M_CSL_DEFAULT.invoke(tl)).intValue();
-            if (cur != want) {
-                Object csl = M_CSL_VALUE_OF.invoke(null, Integer.valueOf(want));
-                M_D_SET_TINT_LIST.invoke(d, csl);
-                if (BOLT_LOG.incrementAndGet() <= 8) {
-                    log("[batt-bolt] 下拉还原 #" + Integer.toHexString(cur)
-                            + " -> #" + Integer.toHexString(want));
+            // ① chargingDrawable（圆环 / 横向）。
+            //    这里**不看 BOLT_TINTED** —— invokeSetColors() 会清掉那个标记，
+            //    但横向的 setColors 并不会顺手把 chargingDrawable 的 tint 还原
+            //    （只有圆环的 setColors 会），按标记判断就会漏掉横向。
+            //    反正走到这里已经过了一层 BOLT_CLEAN，不是每帧都做。
+            Object d = boltDrawable(inst);
+            if (d != null) {
+                setBoltTint(d, def);
+                touched = true;
+                if (M_D_GET_ALPHA != null && M_D_SET_ALPHA != null) {
+                    Object a = M_D_GET_ALPHA.invoke(d);
+                    if (a instanceof Integer && ((Integer) a).intValue() != 255) {
+                        M_D_SET_ALPHA.invoke(d, Integer.valueOf(255));
+                    }
                 }
             }
-            int curA = ((Integer) M_D_GET_ALPHA.invoke(d)).intValue();
-            if (curA != 255) {
-                M_D_SET_ALPHA.invoke(d, Integer.valueOf(255));
-                if (BOLT_LOG.incrementAndGet() <= 8) {
-                    log("[batt-bolt] 下拉还原 alpha " + curA + " -> 255");
-                }
-            }
-            Object cp = readFieldCached(inst, "chargePaint");   // 横/竖电量的闪电是 Bitmap
+            BOLT_TINTED.remove(inst);
+
+            // ② chargePaint 的 ColorFilter（竖向 / 横向的 Bitmap 闪电）
+            Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
                 android.graphics.Paint p = (android.graphics.Paint) cp;
-                if (p.getColorFilter() != null) p.setColorFilter(null);
+                if (p.getColorFilter() != null) {
+                    p.setColorFilter(null);
+                    touched = true;
+                }
+            }
+            PAINT_TINTED.remove(inst);
+
+            BOLT_CLEAN.put(inst, Boolean.TRUE);
+            if (touched && BOLT_LOG.incrementAndGet() <= 8) {
+                log("[batt-bolt] 下拉还原 tint=#" + Integer.toHexString(def)
+                        + " alpha=255 p3=#"
+                        + Integer.toHexString(orig != null ? orig[2] : 0));
             }
         } catch (Throwable t) { logOnce("bolt restore err " + t); }
     }
+
+    /** 写闪电 tint。Drawable#setTint(int) 是公开 API，ColorStateList 内部有缓存，不产生垃圾。 */
+    private static void setBoltTint(Object d, int color) {
+        try {
+            if (M_D_SET_TINT != null) {
+                M_D_SET_TINT.invoke(d, Integer.valueOf(color));
+                return;
+            }
+            d.getClass().getMethod("setTint", int.class)
+                    .invoke(d, Integer.valueOf(color));
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * 状态栏那边已经给这支 drawable 上过的 tint；
+     * null/缺省 = 没上过（或系统 setColors 刚重设过）。
+     */
+    private static final java.util.Map<Object, Integer> BOLT_TINTED =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Integer>());
+
+    /** chargePaint 上已挂的 ColorFilter 颜色（竖向 / 横向的 Bitmap 闪电）。 */
+    private static final java.util.Map<Object, Integer> PAINT_TINTED =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Integer>());
+
+    /** 已经处于「系统默认」状态的实例，避免每帧重复写。 */
+    private static final java.util.Map<Object, Boolean> BOLT_CLEAN =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Boolean>());
 
     private static final java.util.Map<String, java.lang.reflect.Field> OBJ_FIELDS =
             java.util.Collections.synchronizedMap(
@@ -873,28 +936,50 @@ public final class Hook {
 
     private static final AtomicInteger BOLT_LOG = new AtomicInteger();
 
-    private static java.lang.reflect.Method M_D_GET_TINT_LIST;
-    private static java.lang.reflect.Method M_D_SET_TINT_LIST;
+    private static java.lang.reflect.Method M_D_SET_TINT;
     private static java.lang.reflect.Method M_D_GET_ALPHA;
     private static java.lang.reflect.Method M_D_SET_ALPHA;
     private static java.lang.reflect.Method M_D_MUTATE;
-    private static java.lang.reflect.Method M_CSL_VALUE_OF;
-    private static java.lang.reflect.Method M_CSL_DEFAULT;
 
-    /** 反射句柄只解析一次；拿不到就置空，调用点会退化成「不做事」。 */
+    /**
+     * 反射句柄只解析一次。
+     *
+     * 注意：**逐个 try**，别一个 try 包到底。
+     * Drawable#getTintList() 不是公开 API（android-34 的 android.jar 里就没有），
+     * v11.4.2 正是因为它在第一行抛了 NoSuchMethodException，把后面
+     * mutate()/setAlpha() 的解析全带没了 —— 两道防线同时失效，
+     * 表现就是「下拉时闪电仍被着色」。只挑公开且确实存在的方法：
+     *   setTint(int) / getAlpha() / setAlpha(int) / mutate()
+     */
     private static void initBoltRefs(ClassLoader cl) {
-        try {
-            Class<?> d = Class.forName("android.graphics.drawable.Drawable", false, cl);
-            Class<?> csl = Class.forName("android.content.res.ColorStateList", false, cl);
-            M_D_GET_TINT_LIST = d.getMethod("getTintList");
-            M_D_SET_TINT_LIST = d.getMethod("setTintList", csl);
-            M_D_GET_ALPHA = d.getMethod("getAlpha");
-            M_D_SET_ALPHA = d.getMethod("setAlpha", int.class);
-            M_D_MUTATE = d.getMethod("mutate");
-            M_CSL_VALUE_OF = csl.getMethod("valueOf", int.class);
-            M_CSL_DEFAULT = csl.getMethod("getDefaultColor");
-        } catch (Throwable t) { log("initBoltRefs: " + t); }
+        Class<?> d = null;
+        try { d = Class.forName("android.graphics.drawable.Drawable", false, cl); }
+        catch (Throwable t) { log("initBoltRefs: no Drawable " + t); return; }
+
+        M_D_SET_TINT = method(d, "setTint", int.class);
+        M_D_GET_ALPHA = method(d, "getAlpha");
+        M_D_SET_ALPHA = method(d, "setAlpha", int.class);
+        M_D_MUTATE = method(d, "mutate");
+        log("initBoltRefs: setTint=" + (M_D_SET_TINT != null)
+                + " getAlpha=" + (M_D_GET_ALPHA != null)
+                + " setAlpha=" + (M_D_SET_ALPHA != null)
+                + " mutate=" + (M_D_MUTATE != null));
     }
+
+    /** 反射取公开方法；取不到返回 null 并留一条日志（只打前几条）。 */
+    private static java.lang.reflect.Method method(Class<?> c, String name,
+                                                   Class<?>... params) {
+        try {
+            return c.getMethod(name, params);
+        } catch (Throwable t) {
+            if (BOLT_MISS.incrementAndGet() <= 6) {
+                log("no method " + c.getSimpleName() + "#" + name + ": " + t);
+            }
+            return null;
+        }
+    }
+
+    private static final AtomicInteger BOLT_MISS = new AtomicInteger();
 
     /** 反射调用 setColors(int,int,int)，并挡住我们自己引发的记账。 */
     private static void invokeSetColors(Object inst, int[] v) throws Exception {
@@ -910,6 +995,9 @@ public final class Hook {
         } finally {
             BATT_APPLYING.remove();
         }
+        // setColors（圆环那支）会把闪电 tint 重设成 argb(0xe6,p3)，
+        // 「已上色」的标记随之失效 —— 清掉，状态栏下一帧自然会重上。
+        BOLT_TINTED.remove(inst);
     }
 
     private static final java.util.Map<Class<?>, java.lang.reflect.Method[]> BATT_STATE_M =
@@ -1017,69 +1105,65 @@ public final class Hook {
         if (Boolean.TRUE.equals(BATT_APPLYING.get())) return;
         BATT_APPLYING.set(Boolean.TRUE);
         try {
-            Object d = boltDrawable(inst);
-            if (d == null) return;
-
             Integer r = recolor(0xFFFFFFFF);          // 以白色为基准取「深色背景」那组色
             if (r == null) return;
             final int want = r.intValue();
+            final int cfgA = (want >>> 24) & 0xFF;
 
-            // 全部走反射：android.jar 的 stub 里 Drawable 没有 getTintList/setTintList
-            Class<?> cslCls = Class.forName("android.content.res.ColorStateList");
-
-            // ① 色相：tint 用「不透明」的配置色。
-            //    闪电的 tintMode 是 PorterDuff.SRC_ATOP（见 setColors），
-            //    该模式的输出 alpha = **目标 alpha**，把 alpha 塞进 tint 完全无效
-            //    —— 这就是「只有闪电没有透明度」的根因。
-            int tintColor = (want & 0x00FFFFFF) | 0xFF000000;
-            Object cur = null;
-            try { cur = d.getClass().getMethod("getTintList").invoke(d); } catch (Throwable ignored) {}
-            int curColor = 0;
-            if (cur != null) {
-                try {
-                    curColor = (Integer) cur.getClass().getMethod("getDefaultColor").invoke(cur);
-                } catch (Throwable ignored) {}
-            }
-            if (curColor != tintColor) {
-                // **上色前必须 mutate()**：控制中心那支电量 drawable 内部的
-                // chargingDrawable 与本支是从同一个资源 load 出来的；没 mutate 的
-                // Drawable 共用 ConstantState，而 setTintList() 写的正是这份共享
-                // 状态 —— 不 mutate 就会把下拉面板里的闪电一起染上（v11.4.1 反馈）。
-                if (M_D_MUTATE != null) {
-                    try { M_D_MUTATE.invoke(d); } catch (Throwable ignored) {}
+            // ① 圆环 / 横向：chargingDrawable 的 tint。
+            //    色相用「不透明」的配置色 —— tintMode 是 PorterDuff.SRC_ATOP
+            //    （见 setColors），该模式的输出 alpha = **目标 alpha**，把 alpha
+            //    塞进 tint 完全无效（「只有闪电没有透明度」的根因）；
+            //    透明度改走 Drawable#setAlpha。
+            //    不去读现值（getTintList 不是公开 API），用 BOLT_TINTED 记账：
+            //    系统每次 setColors 都会重设 tint，那两处会清掉标记。
+            Object d = boltDrawable(inst);            // 竖/横向没有这个字段，为 null
+            if (d != null) {
+                final int tintColor = (want & 0x00FFFFFF) | 0xFF000000;
+                Integer prev = BOLT_TINTED.get(inst);
+                if (prev == null || prev.intValue() != tintColor) {
+                    // **上色前必须 mutate()**：控制中心那支电量 drawable 内部的
+                    // chargingDrawable 与本支是从同一个资源 load 出来的；没 mutate 的
+                    // Drawable 共用 ConstantState，而 tint 写的正是这份共享状态 ——
+                    // 不 mutate 就会把下拉面板里的闪电一起染上（v11.4.1 反馈）。
+                    if (M_D_MUTATE != null) {
+                        try { M_D_MUTATE.invoke(d); } catch (Throwable ignored) {}
+                    }
+                    setBoltTint(d, tintColor);
+                    BOLT_TINTED.put(inst, Integer.valueOf(tintColor));
+                    BOLT_CLEAN.remove(inst);          // 脏了，下次下拉要还原
+                    if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
+                        log("[batt-bolt] bolt tint -> #" + Integer.toHexString(tintColor));
+                    }
                 }
-                Object tl = cslCls.getMethod("valueOf", int.class)
-                        .invoke(null, Integer.valueOf(tintColor));
-                d.getClass().getMethod("setTintList", cslCls).invoke(d, tl);
-                if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
-                    log("[batt-bolt] bolt hue -> #" + Integer.toHexString(tintColor)
-                            + " (was #" + Integer.toHexString(curColor) + ")");
+                if (M_D_GET_ALPHA != null && M_D_SET_ALPHA != null) {
+                    Object a = M_D_GET_ALPHA.invoke(d);
+                    int curA = (a instanceof Integer) ? ((Integer) a).intValue() : -1;
+                    if (curA != cfgA) {
+                        M_D_SET_ALPHA.invoke(d, Integer.valueOf(cfgA));
+                        BOLT_CLEAN.remove(inst);
+                        if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
+                            log("[batt-bolt] bolt alpha " + curA + " -> " + cfgA);
+                        }
+                    }
                 }
             }
 
-            // ② 横向 / 竖向电量的闪电是 **Bitmap**（字段 chargingBitmap），
+            // ② 竖向 / 横向电量的闪电是 **Bitmap**（字段 chargingBitmap），
             //    用 chargePaint 画出来，根本没有 drawable tint 可改 ——
             //    这就是「闪电未受自定义颜色控制」的原因。
             //    办法是给 chargePaint 挂 PorterDuffColorFilter(SRC_IN)：
             //    SRC_IN 的输出 alpha = Sa × Da，色相和透明度都由配置色决定。
+            //    这一段与 chargingDrawable 无关：竖向电量**只有**这条路。
             Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
-                android.graphics.Paint paint = (android.graphics.Paint) cp;
-                android.graphics.PorterDuffColorFilter cf =
-                        new android.graphics.PorterDuffColorFilter(
-                                want, android.graphics.PorterDuff.Mode.SRC_IN);
-                paint.setColorFilter(cf);
-            }
-
-            // ③ 透明度：只能走 Drawable#setAlpha
-            final int cfgA = (want >>> 24) & 0xFF;
-            int curA = -1;
-            try { curA = (Integer) d.getClass().getMethod("getAlpha").invoke(d); }
-            catch (Throwable ignored) {}
-            if (curA != cfgA) {
-                d.getClass().getMethod("setAlpha", int.class).invoke(d, Integer.valueOf(cfgA));
-                if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
-                    log("[batt-bolt] bolt alpha " + curA + " -> " + cfgA);
+                Integer prevP = PAINT_TINTED.get(inst);
+                if (prevP == null || prevP.intValue() != want) {
+                    ((android.graphics.Paint) cp).setColorFilter(
+                            new android.graphics.PorterDuffColorFilter(
+                                    want, android.graphics.PorterDuff.Mode.SRC_IN));
+                    PAINT_TINTED.put(inst, Integer.valueOf(want));
+                    BOLT_CLEAN.remove(inst);
                 }
             }
         } catch (Throwable t) { logOnce("bolt err " + t); }
