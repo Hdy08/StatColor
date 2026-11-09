@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.5.2";
+    public static final String VERSION = "11.5.3";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -1064,12 +1064,17 @@ public final class Hook {
             }
             BOLT_TINTED.remove(inst);
 
-            // ② chargePaint 的 ColorFilter（竖向 / 横向的 Bitmap 闪电）
+            // ② chargePaint 的 ColorFilter + alpha（竖向 / 横向的 Bitmap 闪电）
             Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
                 android.graphics.Paint p = (android.graphics.Paint) cp;
                 if (p.getColorFilter() != null) {
                     p.setColorFilter(null);
+                    touched = true;
+                }
+                Integer origA = PAINT_ALPHA_ORIG.remove(inst);
+                if (origA != null && p.getAlpha() != origA.intValue()) {
+                    p.setAlpha(origA.intValue());      // 还原系统原本的半透明画法
                     touched = true;
                 }
             }
@@ -1106,6 +1111,14 @@ public final class Hook {
 
     /** chargePaint 上已挂的 ColorFilter 颜色（竖向 / 横向的 Bitmap 闪电）。 */
     private static final java.util.Map<Object, Integer> PAINT_TINTED =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Integer>());
+
+    /**
+     * chargePaint 上色**之前**它自己的 alpha（系统默认值，实测约 0x66）。
+     * 下拉面板那边还原时要用它，不能一律写 255 —— 那会改变系统原本的画法。
+     */
+    private static final java.util.Map<Object, Integer> PAINT_ALPHA_ORIG =
             java.util.Collections.synchronizedMap(
                     new java.util.WeakHashMap<Object, Integer>());
 
@@ -1367,15 +1380,31 @@ public final class Hook {
             //    办法是给 chargePaint 挂 PorterDuffColorFilter(SRC_IN)：
             //    SRC_IN 的输出 alpha = Sa × Da，色相和透明度都由配置色决定。
             //    这一段与 chargingDrawable 无关：竖向电量**只有**这条路。
+            //
+            //    坑：滤镜的 alpha 管不了 Paint 自己的 alpha ——
+            //    最终 alpha = 滤镜 alpha × paint alpha × 位图 alpha，
+            //    ColorOS 给 chargePaint 设了约 0x66 的 alpha（闪电本来就画成半透明），
+            //    只改滤镜的结果是「浅色场景设了 FF 仍然只有 40%」。
+            //    所以滤镜用**不透明**色，透明度单独写进 Paint#setAlpha。
             Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
+                android.graphics.Paint p = (android.graphics.Paint) cp;
                 Integer prevP = PAINT_TINTED.get(inst);
                 if (prevP == null || prevP.intValue() != want) {
-                    ((android.graphics.Paint) cp).setColorFilter(
-                            new android.graphics.PorterDuffColorFilter(
-                                    want, android.graphics.PorterDuff.Mode.SRC_IN));
+                    if (!PAINT_ALPHA_ORIG.containsKey(inst)) {
+                        PAINT_ALPHA_ORIG.put(inst, Integer.valueOf(p.getAlpha()));
+                    }
+                    int prevA = p.getAlpha();
+                    p.setAlpha(cfgA);
+                    p.setColorFilter(new android.graphics.PorterDuffColorFilter(
+                            (want & 0x00FFFFFF) | 0xFF000000,
+                            android.graphics.PorterDuff.Mode.SRC_IN));
                     PAINT_TINTED.put(inst, Integer.valueOf(want));
                     BOLT_CLEAN.remove(inst);
+                    if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
+                        log("[batt-bolt] paint alpha " + prevA + " -> " + cfgA
+                                + " color=#" + Integer.toHexString((want & 0x00FFFFFF) | 0xFF000000));
+                    }
                 }
             }
         } catch (Throwable t) { logOnce("bolt err " + t); }
@@ -1444,6 +1473,10 @@ public final class Hook {
      * 充电时 p1 是绿色（状态色），但底环 / 边框仍是系统给的中性色：
      * 深色背景 → 白系（#4DFFFFFF / #CCFFFFFF），浅色背景 → 黑系（#4D000000）。
      * 拿它当 recolor() 的种子，闪电才会用对那一组配置色。
+     *
+     * 注意：只认**这一支 drawable 自己**的颜色，不要顺手更新全局极性 ——
+     * 状态栏、锁屏、充电动画会各自画各自的电量，颜色正好相反，
+     * 全局记下来就会 1~2 秒翻一次，闪电在两组颜色之间来回闪（实测）。
      */
     private static int statusBarSeed(int[] orig) {
         if (orig != null) {
@@ -1451,14 +1484,8 @@ public final class Hook {
                 if (((c >>> 24) & 0xFF) == 0) continue;
                 if (isSystemStatusColor(c)) continue;
                 int rgb = c & 0x00FFFFFF;
-                if (rgb == 0x00FFFFFF) {                      // 白系 → 深色背景
-                    noteBarTint(0xFFFFFFFF, "batt-orig");
-                    return 0xFFFFFFFF;
-                }
-                if (rgb == 0x000000) {                        // 黑系 → 浅色背景
-                    noteBarTint(0xFF000000, "batt-orig");
-                    return 0xFF000000;
-                }
+                if (rgb == 0x00FFFFFF) return 0xFFFFFFFF;     // 白系 → 深色背景
+                if (rgb == 0x000000) return 0xFF000000;       // 黑系 → 浅色背景
             }
         }
         return barSeedShared();
