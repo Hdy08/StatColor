@@ -38,6 +38,7 @@ import android.widget.Toast;
 import com.statcolor.R;
 import com.statcolor.app.Config;
 import com.statcolor.app.Hook;
+import com.statcolor.app.Rom;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -615,11 +616,16 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 把配置写成 "key=value" 文本，镜像到 /data/local/tmp/statcolor.conf（0644）。
+     * 把配置写成 "key=value" 文本，镜像到全局可读位置。
      *
-     * <p>这是 Hook 侧最可靠的配置来源：不依赖 XSharedPreferences 的可见性，
-     * 也不受 getSharedPreferences 在 CE/DE 存储间分叉的影响。需要 root；
-     * 失败不致命，Hook 会退回另外两条路。
+     * <p>两个位置都写：
+     * <ul>
+     *   <li>{@code /data/local/tmp/statcolor.conf} —— ColorOS 的 SystemUI 能读</li>
+     *   <li>{@code /data/system/statcolor.conf} —— HyperOS 的 SystemUI 只认这条
+     *       （/data/local/tmp 是 shell_data_file，system_app 连 search 都被
+     *       SELinux 拒绝；/data/system 是 system_data_file，可读）</li>
+     * </ul>
+     * 只要有一条写成功就算成功，Hook 侧会自己挑能读的那条。
      *
      * @return null 表示成功，否则返回错误说明
      */
@@ -642,12 +648,29 @@ public class MainActivity extends Activity {
                 fos.close();
             }
 
-            String out = exec("su", "-c",
-                    "cp " + tmp.getAbsolutePath() + " " + Hook.CONF_FILE
-                            + " && chmod 644 " + Hook.CONF_FILE);
-            String verify = exec("su", "-c", "ls -l " + Hook.CONF_FILE);
-            if (verify == null || !verify.contains("statcolor.conf")) {
-                return "su 写入失败，输出=" + out;
+            StringBuilder ok = new StringBuilder();
+            StringBuilder err = new StringBuilder();
+            for (String path : Hook.CONF_PATHS) {
+                String out = exec("su", "-c",
+                        "cp " + tmp.getAbsolutePath() + " " + path
+                                + " && chmod 644 " + path);
+                String verify = exec("su", "-c", "ls -l " + path);
+                if (verify == null || verify.startsWith("__ERR__") || verify.indexOf(path) < 0) {
+                    if (err.length() > 0) err.append('\n');
+                    err.append("✗ ").append(path);
+                    String o = out == null ? "" : out.trim();
+                    if (o.length() > 0) {
+                        if (o.length() > 100) o = o.substring(0, 100) + "…";
+                        err.append("（").append(o).append('）');
+                    }
+                } else {
+                    if (ok.length() > 0) ok.append('\n');
+                    ok.append(path);
+                }
+            }
+            lastSyncedPaths = ok.toString();
+            if (ok.length() == 0) {
+                return err.length() == 0 ? "su 写入失败" : err.toString();
             }
             return null;
         } catch (Throwable t) {
@@ -655,21 +678,27 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 最近一次成功写入的配置路径（多行）。 */
+    private String lastSyncedPaths = "";
+
     /** 重启 SystemUI 让配置生效。先同步配置文件，再 kill。 */
     private void restartSystemUi() {
         new Thread(new Runnable() {
             @Override public void run() {
                 final String syncErr = syncConfFile();
+                final String syncedPaths = lastSyncedPaths;
+                final String firstPath = syncedPaths.isEmpty()
+                        ? Hook.CONF_FILE_SYSTEM : syncedPaths.split("\n")[0];
                 // 每次应用后把配置文件读回来打出来，取代原来的「自诊断」按钮
                 final String dump = syncErr == null
-                        ? exec("su", "-c", "cat " + Hook.CONF_FILE) : null;
+                        ? exec("su", "-c", "cat " + firstPath) : null;
                 final String r = exec("su", "-c", "killall com.android.systemui");
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override public void run() {
                         if (syncErr != null) {
                             appendLog("配置同步失败 —— " + syncErr);
                         } else {
-                            appendLog("配置已写入 " + Hook.CONF_FILE);
+                            appendLog("配置已写入：\n" + syncedPaths);
                             appendLog(dump == null || dump.trim().isEmpty()
                                     ? "(读不到内容)" : dump.trim());
                         }
@@ -732,7 +761,7 @@ public class MainActivity extends Activity {
      * 直接去捞最后一条，比让用户自己翻日志快得多。
      */
     private void reportModuleState() {
-        appendLog("模块版本 " + Hook.VERSION);
+        appendLog("模块版本 " + Hook.VERSION + " · 当前系统 " + Rom.describe());
         new Thread(new Runnable() {
             @Override public void run() {
                 final String out = exec("su", "-c",

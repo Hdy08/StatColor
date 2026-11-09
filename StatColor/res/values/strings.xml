@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">状态栏着色</string>
-    <string name="module_description">统一修改 ColorOS / OxygenOS 状态栏上所有元素（时钟、网速、信号、WiFi、电量等）的颜色与透明度，通知图标与控制中心不受影响。</string>
+    <string name="module_description">统一修改 ColorOS / OxygenOS / HyperOS 状态栏上所有元素（时钟、网速、信号、WiFi、电量等）的颜色与透明度，通知图标与控制中心不受影响。</string>
 
     <!-- 总开关 -->
     <string name="settings_enable">启用模块</string>

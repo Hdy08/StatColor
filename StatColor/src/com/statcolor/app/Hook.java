@@ -45,12 +45,40 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.4.3";
+    public static final String VERSION = "11.5";
 
-    /** 配置镜像文件，由模块界面写出，权限 0644。 */
+    /**
+     * 配置镜像文件（旧位置）。
+     *
+     * SELinux 差异（实测 HyperOS 3）：SystemUI 跑在 system_app 域，
+     * 而 /data/local/tmp 属于 shell_data_file —— system_app 连 search 都不允许，
+     * 所以这条路径在 HyperOS 上恒不可读（dmesg 里能看到 avc denied）。
+     * ColorOS 的策略放过了它，因此旧路径保留，作为兼容回退。
+     */
     public static final String CONF_FILE = "/data/local/tmp/statcolor.conf";
 
+    /**
+     * 配置镜像文件（HyperOS 主路径）。
+     *
+     * /data/system 属于 system_data_file，system_app 可读；由模块界面用 su 写入。
+     */
+    public static final String CONF_FILE_SYSTEM = "/data/system/statcolor.conf";
+
+    /** 按「当前 ROM 最可能可读」的顺序尝试。 */
+    private static String[] confPaths() {
+        return Rom.isHyperOs()
+                ? new String[] { CONF_FILE_SYSTEM, CONF_FILE }
+                : new String[] { CONF_FILE, CONF_FILE_SYSTEM };
+    }
+
+    /** 模块界面写配置时依次写出的全部位置（两边都写，换 ROM 也能用）。 */
+    public static final String[] CONF_PATHS = { CONF_FILE_SYSTEM, CONF_FILE };
+
     private static volatile Context sCtx;
+
+    /** 防止重复注入（实测 SystemUI 启动时会连续回调两次 loadPackage）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean INSTALLED =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     /** 本线程当前是否正在绘制状态栏窗口。 */
     private static final ThreadLocal<Boolean> IN_STATUS_BAR = new ThreadLocal<Boolean>();
@@ -62,7 +90,6 @@ public final class Hook {
             java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<Integer>());
     private static volatile boolean sConfLogged = false;
     private static volatile boolean sWindowLogged = false;
-    private static volatile boolean sTreeDumped = false;
 
     private Hook() {}
 
@@ -73,8 +100,19 @@ public final class Hook {
                 || pkg.startsWith("com.oplus.systemui");
         if (!wanted) return;
 
+        // 实测 SystemUI 进程里 loadPackage 会被回调两次（相隔十几毫秒，
+        // ClassLoader 每次都是新包装对象，按 loader 去重挡不住）。
+        // 不挡住的话每个方法会挂两遍回调，扫描期等于双倍开销。
+        if (!INSTALLED.compareAndSet(false, true)) {
+            log("skip duplicate loadPackage(" + pkg + ")");
+            return;
+        }
+
         try {
-            log("=== v" + VERSION + " enter " + pkg);
+            int rom = Rom.detect(cl);
+            log("=== v" + VERSION + " enter " + pkg
+                    + " rom=" + Rom.describe(rom)
+                    + " display=" + android.os.Build.DISPLAY);
             initBoltRefs(cl);                             // 闪电还原要用的反射句柄
 
             // 尽早抓 Context：StatusBarIconView 构造得早且必定发生
@@ -83,26 +121,28 @@ public final class Hook {
                 XposedBridge.hookAllConstructors(iconView, new XC_MethodHook() {
                     @Override protected void afterHookedMethod(MethodHookParam param) {
                         captureContext(param.thisObject);
-                        registerIconView(param.thisObject);
                     }
                 });
             }
 
+            // ── 通用通道：按状态栏窗口划界，与 ROM 无关 ──
             hookStatusBarDrawScope(cl);
             hookPaint(cl);
             hookImageTint(cl);
-            // 关键：系统图标（信号/WiFi/电池）也是 StatusBarIconView，
-            // 必须单独挂 tint —— 但要与左侧通知图标区分开
-            // 恢复 v1.3 中确实生效过的路径：对已登记的 StatusBarIconView
-            // 实例挂框架层 tint。电量图标就是靠这条改成功的。
-            // 实测靶点：电量图标 CircleBatteryContentDrawable.setColors(int,int,int)
-            // 以及信号/WiFi 的 StatusBarIconView.updateDecorColor
-            hookBatteryAndDecorColor(cl);
-            // WiFi / 信号：颜色走通用 drawable tint，用调用栈判定归属
-            hookMobileWifiTint(cl);
-            // 诊断：把状态栏窗口绘制期间的所有 drawable tint 调用列出来，
-            // 用来确认 WiFi/信号到底走不走 tint（v6.0 证明它们不走 setTint）
-            hookDrawableTintSurvey(cl);
+            hookTextColor(cl);
+
+            if (rom == Rom.HYPEROS) {
+                // HyperOS：电量图标是自绘控件，走 MiuiBatteryMeter* 专用适配
+                HyperOsHooks.install(cl);
+            } else {
+                // ColorOS / OxygenOS；识别不出 ROM 时也走这里（保守回退，
+                // 类不存在时这些钩子只是打 MISS，不会误伤）
+                hookBatteryAndDecorColor(cl);
+                // WiFi/信号 tint 与 drawable 普查是当年定位 OPLUS 类名用的探针
+                hookMobileWifiTint(cl);
+                hookDrawableTintSurvey(cl);
+                if (rom == Rom.UNKNOWN) log("unknown rom: fallback to ColorOS hooks");
+            }
 
             log("=== v" + VERSION + " done " + pkg);
             diag("loadPackage OK");
@@ -129,7 +169,11 @@ public final class Hook {
                         View root = rootViewOf(param.thisObject);
                         boolean isSb = isStatusBarRoot(root);
                         IN_STATUS_BAR.set(isSb);
-                        if (isSb) { dumpStatusBarTree(root); maybeSweep(root); }
+                        if (isSb) {
+                            captureContext(root);   // 兜底：不依赖 StatusBarIconView
+                            scheduleTreeDump(root);
+                            maybeSweep(root);
+                        }
                     } catch (Throwable t) {
                         IN_STATUS_BAR.set(Boolean.FALSE);
                     }
@@ -217,8 +261,30 @@ public final class Hook {
     private static void sweep(View v, int depth) {
         if (v == null || depth > 16) return;
         String cn = v.getClass().getName();
-        if (cn.contains("Notification")) return;          // 通知图标不动
-        if (v instanceof android.widget.ImageView) tintIcon((android.widget.ImageView) v);
+
+        if (Rom.isHyperOs()) {
+            // HyperOS 的坑：系统图标区(SYSTEM_ICON_AREA)整个被包在
+            // MiuiNotificationStatusContainer 里 —— 名字带 Notification，
+            // 但里面装的是 WiFi/信号/电量。按类名一刀切会把系统图标全部漏掉
+            // （v10.3 在 HyperOS 上一条 [sweep] 都没有，就是这个原因）。
+            // 真正该排除的是「通知图标容器」本身，按资源 id 精确判定。
+            if (isNotificationIconArea(v)) return;
+            if (cn.contains("FocusedNotifPrompt")) return;   // 左侧通知提示
+            if (cn.contains("Island")) return;               // 灵动岛保持系统色
+        } else {
+            // ColorOS：通知图标子树类名带 Notification，沿用它原来的规则
+            if (cn.contains("Notification")) return;
+        }
+
+        if (HyperOsHooks.isBatteryView(cn)) {
+            // 电量是自绘控件，ImageView 的 tint 对它无效，必须走专用逻辑
+            HyperOsHooks.onSweep(v);
+        } else if (v instanceof android.widget.ImageView) {
+            tintIcon((android.widget.ImageView) v);
+        } else if (v instanceof android.widget.TextView) {
+            tintText((android.widget.TextView) v);
+        }
+
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             int n = g.getChildCount();
@@ -226,28 +292,233 @@ public final class Hook {
         }
     }
 
+    // ───────── 通知图标区（HyperOS 按资源 id 精确排除）
+
+    private static int sNotifAreaIdDrip = 0;
+    private static int sNotifAreaIdFull = 0;
+    private static boolean sNotifIdsResolved;
+
+    private static boolean isNotificationIconArea(View v) {
+        int id = v.getId();
+        if (id == 0) return false;
+        if (!sNotifIdsResolved) resolveNotifAreaIds(v);
+        return id == sNotifAreaIdDrip || id == sNotifAreaIdFull;
+    }
+
+    private static void resolveNotifAreaIds(View v) {
+        sNotifIdsResolved = true;
+        try {
+            android.content.Context ctx = v.getContext();
+            android.content.res.Resources r = ctx.getResources();
+            sNotifAreaIdDrip = r.getIdentifier(
+                    "notification_icon_area", "id", "com.android.systemui");
+            sNotifAreaIdFull = r.getIdentifier(
+                    "fullscreen_notification_icon_area", "id", "com.android.systemui");
+            log("notif icon area ids: drip=0x"
+                    + Integer.toHexString(sNotifAreaIdDrip)
+                    + " full=0x" + Integer.toHexString(sNotifAreaIdFull));
+        } catch (Throwable t) {
+            log("resolve notif area ids failed: " + t);
+        }
+    }
+
+    /**
+     * 是不是「配置里的颜色」本身（深/浅两组的 RGB）。
+     *
+     * 用途：改色是幂等刷的，一旦视图已经是自定义色，中性色判定就过不去。
+     * 有了这个判据，改配置后扫描能把旧自定义色再刷成新自定义色 ——
+     * 不必等 SystemUI 重启。撞色时最多多刷一次，无害。
+     */
+    private static boolean isConfiguredColor(int c) {
+        Context ctx = sCtx;
+        if (ctx == null) return false;
+        Conf conf = readConf(ctx);
+        if (conf == null) return false;
+        int rgb = c & 0x00FFFFFF;
+        return rgb == (Config.parseColor(conf.dark, 0xFFFFFFFF) & 0x00FFFFFF)
+                || rgb == (Config.parseColor(conf.light, 0xFF000000) & 0x00FFFFFF);
+    }
+
+    // ───────── 文字：状态栏里所有中性色的 TextView
+
+    private static final AtomicInteger TEXT_HITS = new AtomicInteger();
+
+    /** 已确认属于状态栏的 TextView（弱引用，避免长期持有视图）。 */
+    private static final java.util.Set<android.widget.TextView> SB_TEXT_VIEWS =
+            java.util.Collections.synchronizedSet(
+                    java.util.Collections.newSetFromMap(
+                            new java.util.WeakHashMap<android.widget.TextView, Boolean>()));
+
+    /**
+     * 状态栏文字（时钟、网速、温度/功耗、电量百分比…）在 HyperOS 上
+     * 不是每帧重设 Paint 颜色，而是 onDarkChanged 时调用 setTextColor 一次。
+     * 那条调用发生在窗口绘制之外，Paint#setColor 的窗口范围钩子抓不到，
+     * 所以这里在视图树扫描里直接改 TextView。
+     *
+     * 只改中性色（R=G=B）：饱和色是系统的状态色（充电绿、低电量红），
+     * 与图标通道保持同一条规矩。亮暗都接受 —— 深色文字对应浅色背景，
+     * 正好落到「浅色背景」那组配置色。
+     */
+    private static void tintText(android.widget.TextView tv) {
+        try {
+            SB_TEXT_VIEWS.add(tv);          // 供 setTextColor 钩子做当次拦截
+            if (tv.getVisibility() != View.VISIBLE) return;
+            int cur = tv.getCurrentTextColor();
+            if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
+            Integer r = recolor(cur);
+            if (r == null) return;
+            int out = r.intValue();
+            if (out == cur) return;
+            tv.setTextColor(out);
+            if (TEXT_HITS.incrementAndGet() <= 15) {
+                log("[sweep-text] " + tv.getClass().getSimpleName()
+                        + " #" + Integer.toHexString(cur)
+                        + " -> #" + Integer.toHexString(out));
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    // ───────── TextView#setTextColor：从源头拦截，消除 1Hz 闪烁
+
+    /**
+     * 为什么还要拦 setTextColor
+     * ------------------------
+     * 实测 HyperOS 的「功耗/温度」指示器是 NetworkSpeedView 里的一个 TextView，
+     * 它每次刷新数值都会重走一遍 MIUI 的 dark 回调（onDarkChanged →
+     * setTextColor(系统色)），把颜色打回原样。视图树扫描最快也要 80ms
+     * 才能刷回来 —— 表现就是「着色 / 未着色」之间来回闪。
+     *
+     * 在 setTextColor 这一层直接换掉入参，颜色根本没机会变回原色：
+     *   - 扫描登记过的 TextView      → 无条件按状态栏处理（快速路径）
+     *   - 未登记的：当前挂在状态栏窗口下才处理，并顺手登记
+     * 通知栏 / 控制中心 / 锁屏的 TextView 不满足上面任何一条，不会被碰。
+     */
+    private static void hookTextColor(ClassLoader cl) {
+        try {
+            Class<?> tvCls = Class.forName("android.widget.TextView", false, cl);
+            Class<?> cslCls = Class.forName("android.content.res.ColorStateList", false, cl);
+
+            final java.lang.reflect.Method mInt =
+                    tvCls.getDeclaredMethod("setTextColor", int.class);
+            XposedBridge.hookMethod(mInt, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object self = param.thisObject;
+                        if (!(self instanceof android.widget.TextView)) return;
+                        android.widget.TextView tv = (android.widget.TextView) self;
+                        if (!isStatusBarText(tv)) return;
+                        Object a = param.args[0];
+                        if (!(a instanceof Integer)) return;
+                        int cur = (Integer) a;
+                        if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
+                        Integer r = recolor(cur);
+                        if (r == null || r.intValue() == cur) return;
+                        // 诊断：系统想把「已经是我们颜色的文字」打回中性色 ——
+                        // 这就是 v10.3 上功耗指示器 1Hz 闪烁的来源，现在被当次拦下。
+                        if (isNeutralColor(cur)
+                                && isConfiguredColor(tv.getCurrentTextColor())) {
+                            int n = TEXT_GUARD.incrementAndGet();
+                            if (n <= 5 || n % 50 == 0) {
+                                log("[flicker-guard] #" + n + " "
+                                        + tv.getClass().getSimpleName()
+                                        + " #" + Integer.toHexString(cur)
+                                        + " -> #" + Integer.toHexString(r.intValue()));
+                            }
+                        }
+                        param.args[0] = r;
+                        if (TEXT_REMAP.incrementAndGet() <= 20) {
+                            log("[text-color] " + tv.getClass().getSimpleName()
+                                    + " #" + Integer.toHexString(cur)
+                                    + " -> #" + Integer.toHexString(r.intValue()));
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+            log("hooked TextView#setTextColor(int)");
+
+            final java.lang.reflect.Method mCsl =
+                    tvCls.getDeclaredMethod("setTextColor", cslCls);
+            XposedBridge.hookMethod(mCsl, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object self = param.thisObject;
+                        if (!(self instanceof android.widget.TextView)) return;
+                        android.widget.TextView tv = (android.widget.TextView) self;
+                        if (!isStatusBarText(tv)) return;
+                        Object o = param.args[0];
+                        if (o == null) return;
+                        // 有状态的颜色（按下/禁用）保留原样
+                        try {
+                            Object sf = o.getClass().getMethod("isStateful").invoke(o);
+                            if (Boolean.TRUE.equals(sf)) return;
+                        } catch (Throwable ignored) {}
+                        int cur = (Integer) o.getClass()
+                                .getMethod("getDefaultColor").invoke(o);
+                        if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
+                        Integer r = recolor(cur);
+                        if (r == null || r.intValue() == cur) return;
+                        param.args[0] = newCsl(o, r.intValue());
+                    } catch (Throwable ignored) {}
+                }
+            });
+            log("hooked TextView#setTextColor(ColorStateList)");
+        } catch (Throwable t) {
+            log("hookTextColor failed: " + t);
+        }
+    }
+
+    /** 这个 TextView 是不是状态栏里的文字。 */
+    private static boolean isStatusBarText(android.widget.TextView tv) {
+        if (SB_TEXT_VIEWS.contains(tv)) return true;
+        if (!isInStatusBarWindow(tv)) return false;
+        SB_TEXT_VIEWS.add(tv);
+        return true;
+    }
+
+    private static final AtomicInteger TEXT_REMAP = new AtomicInteger();
+    private static final AtomicInteger TEXT_GUARD = new AtomicInteger();
+
     private static void tintIcon(android.widget.ImageView iv) {
         try {
             int w = iv.getWidth();
             if (w <= 0) return;                            // 没布局，位置不可信
-            // 必须用屏幕坐标：getLeft() 是相对父容器的，状态栏图标容器的
-            // left 只有几十像素，用它判断「右半屏」永远为假（v8.0 实测
-            // 一条 [sweep] 都没打出来就是这个原因）。
-            int[] loc = new int[2];
-            iv.getLocationOnScreen(loc);
-            int screenW = iv.getResources().getDisplayMetrics().widthPixels;
-            if (loc[0] + w / 2 <= screenW / 2) {
-                if (SWEEP_SKIP.incrementAndGet() <= 6) {
-                    log("[sweep-skip] 左半屏 " + iv.getClass().getSimpleName()
-                            + " x=" + loc[0] + " w=" + w);
+
+            boolean hyper = Rom.isHyperOs();
+            if (!hyper) {
+                // ColorOS 的「右半屏 = 系统图标」经验规则（左半屏是通知图标）
+                // 必须用屏幕坐标：getLeft() 是相对父容器的，状态栏图标容器的
+                // left 只有几十像素，用它判断「右半屏」永远为假（v8.0 实测
+                // 一条 [sweep] 都没打出来就是这个原因）。
+                int[] loc = new int[2];
+                iv.getLocationOnScreen(loc);
+                int screenW = iv.getResources().getDisplayMetrics().widthPixels;
+                if (loc[0] + w / 2 <= screenW / 2) {
+                    if (SWEEP_SKIP.incrementAndGet() <= 6) {
+                        log("[sweep-skip] 左半屏 " + iv.getClass().getSimpleName()
+                                + " x=" + loc[0] + " w=" + w);
+                    }
+                    return;
                 }
-                return;
             }
+            // HyperOS 不用位置规则：通知图标容器已按资源 id 整块排除，
+            // 剩下的 ImageView 都是状态栏自己的元素（信号/WiFi/NFC/蓝牙…）
+
             android.content.res.ColorStateList tl = iv.getImageTintList();
             if (tl == null) return;
             int cur = tl.getDefaultColor();
             if (((cur >>> 24) & 0xFF) == 0) return;
-            Integer r = tintArg(cur);
+            // HyperOS 的图标 tint 一律是中性的主题色（#e6ffffff 之类），
+            // 只改中性值可以避开充电绿 / 低电量红这类状态色；
+            // 已经是自定义色的也放行，这样改配置后能直接刷成新颜色。
+            // ColorOS 走 v11.4 的统一规则 tintArg()（状态色只缩 alpha）。
+            Integer r;
+            if (hyper) {
+                if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
+                r = recolor(cur);
+                if (r != null) sSbAlpha = (r.intValue() >>> 24) & 0xFF;
+            } else {
+                r = tintArg(cur);
+            }
             if (r == null) return;
             int out = r.intValue();
             if (out == cur) return;
@@ -338,14 +609,33 @@ public final class Hook {
 
     // ─────────────── 诊断：dump 状态栏视图树（一次性）
 
+    private static final java.util.concurrent.atomic.AtomicBoolean TREE_DUMP_SCHEDULED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
     /**
-     * 把状态栏窗口的视图树打印出来：类名、位置、文字颜色、drawable 类型。
-     * 为的是一次看清右边那组图标（信号/WiFi/电池）究竟是什么控件、
-     * 颜色从哪来 —— 而不是继续靠猜。
+     * 状态栏第一次绘制时根视图还没 inflate 完 —— 实测那一刻只有两个空
+     * FrameLayout，立即 dump 等于没 dump（v10.3 在 HyperOS 上的日志就是
+     * 三行空树）。所以延迟 3 秒再 dump 一次，给「换 ROM 适配」留一条
+     * 看清真实视图树的捷径：类名 / 资源 id / 文字颜色 / tint / drawable。
      */
+    private static void scheduleTreeDump(final View root) {
+        if (!TREE_DUMP_SCHEDULED.compareAndSet(false, true)) return;
+        try {
+            root.postDelayed(new Runnable() {
+                @Override public void run() {
+                    try {
+                        dumpStatusBarTree(root);
+                    } catch (Throwable t) {
+                        log("dump tree failed: " + t);
+                    }
+                }
+            }, 3000);
+        } catch (Throwable t) {
+            log("schedule tree dump failed: " + t);
+        }
+    }
+
     private static void dumpStatusBarTree(View root) {
-        if (sTreeDumped) return;
-        sTreeDumped = true;
         try {
             StringBuilder sb = new StringBuilder();
             walk(root, 0, sb);
@@ -359,7 +649,7 @@ public final class Hook {
     }
 
     private static void walk(View v, int depth, StringBuilder sb) {
-        if (v == null || depth > 8) return;
+        if (v == null || depth > 12) return;
         try {
             StringBuilder line = new StringBuilder();
             for (int i = 0; i < depth; i++) line.append("  ");
@@ -368,6 +658,8 @@ public final class Hook {
                 .append(" @").append(v.getLeft()).append(',').append(v.getTop())
                 .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
                 .append(" vis=").append(v.getVisibility());
+            int vid = v.getId();
+            if (vid != 0) line.append(" id=0x").append(Integer.toHexString(vid));
 
             if (v instanceof android.widget.TextView) {
                 android.widget.TextView tv = (android.widget.TextView) v;
@@ -402,98 +694,6 @@ public final class Hook {
             }
         } catch (Throwable ignored) {}
     }
-
-    // ───────── v1.3 恢复：已登记 StatusBarIconView 的框架层 tint
-
-    /**
-     * v1.3 实测能改电量图标的那条路径，原样恢复。
-     *
-     * 做法：StatusBarIconView 构造时把实例登记下来，然后挂
-     * ImageView#setImageTintList / setColorFilter，只对登记的实例生效。
-     * 与 v1.3 唯一不同的是**不加位置过滤**（位置在 tint 调用时还没算出来），
-     * 但会打印每个被改视图的位置，用来确认到底改到了谁。
-     */
-    private static void hookRegisteredIconViewTint(ClassLoader cl) {
-        try {
-            Class<?> iv = Class.forName("android.widget.ImageView", false, cl);
-            Class<?> csl = Class.forName("android.content.res.ColorStateList", false, cl);
-            Class<?> pdm = Class.forName("android.graphics.PorterDuff$Mode", false, cl);
-
-            final java.lang.reflect.Method tintM = iv.getDeclaredMethod("setImageTintList", csl);
-            XposedBridge.hookMethod(tintM, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object self = param.thisObject;
-                        if (!isRegisteredIconView(self)) return;
-                        Object o = param.args[0];
-                        if (o == null) return;
-                        int cur = (Integer) o.getClass().getMethod("getDefaultColor").invoke(o);
-                        Integer r = recolor(cur);
-                        if (r == null || r.intValue() == cur) return;
-                        java.lang.reflect.Constructor<?> ctor =
-                                o.getClass().getDeclaredConstructor(int.class);
-                        ctor.setAccessible(true);
-                        param.args[0] = ctor.newInstance(r.intValue());
-                        logViewHit("reg-tint", self, cur, r);
-                    } catch (Throwable t) { logOnce("reg-tint err " + t); }
-                }
-            });
-            log("hooked ImageView#setImageTintList (registered StatusBarIconView)");
-
-            final java.lang.reflect.Method cfM =
-                    iv.getDeclaredMethod("setColorFilter", int.class, pdm);
-            XposedBridge.hookMethod(cfM, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object self = param.thisObject;
-                        if (!isRegisteredIconView(self)) return;
-                        Object a0 = param.args[0];
-                        if (!(a0 instanceof Integer)) return;
-                        int cur = (Integer) a0;
-                        Integer r = tintArg(cur);           // 状态色只缩 alpha
-                        if (r == null) return;
-                        param.args[0] = r;
-                        logViewHit("reg-cf", self, cur, r);
-                    } catch (Throwable ignored) {}
-                }
-            });
-            log("hooked ImageView#setColorFilter (registered StatusBarIconView)");
-        } catch (Throwable t) {
-            log("hookRegisteredIconViewTint failed: " + t);
-        }
-    }
-
-    /** 记录被改色的视图：位置 + 类名，用来确认到底改到了哪些图标。 */
-    private static void logViewHit(String tag, Object self, int cur, int rep) {
-        try {
-            String pos = "?";
-            String cls = self == null ? "?" : self.getClass().getSimpleName();
-            if (self instanceof View) {
-                View v = (View) self;
-                pos = v.getLeft() + "," + v.getTop()
-                        + " " + v.getWidth() + "x" + v.getHeight();
-            }
-            if (VIEW_HITS.incrementAndGet() <= 25) {
-                log("[" + tag + "] " + cls + " @" + pos
-                        + " #" + Integer.toHexString(cur)
-                        + " -> #" + Integer.toHexString(rep));
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    private static final java.util.Map<Object, Boolean> ICON_VIEWS =
-            java.util.Collections.synchronizedMap(
-                    new java.util.WeakHashMap<Object, Boolean>());
-
-    private static void registerIconView(Object v) {
-        try { if (v != null) ICON_VIEWS.put(v, Boolean.TRUE); } catch (Throwable ignored) {}
-    }
-
-    private static boolean isRegisteredIconView(Object v) {
-        try { return v != null && ICON_VIEWS.containsKey(v); } catch (Throwable t) { return false; }
-    }
-
-    private static final AtomicInteger VIEW_HITS = new AtomicInteger();
 
     // ───────── 实测靶点：电量图标 + 信号/WiFi 装饰色
 
@@ -1629,21 +1829,6 @@ public final class Hook {
 
     private static final AtomicInteger DIAG_COUNT = new AtomicInteger();
 
-    /**
-     * 放宽版判定：状态栏里「不像背景」的颜色都算图标色。
-     *
-     * 为什么需要：ColorOS 的信号/WiFi 图标自带色系（绿/黄/红），
-     * 严格的灰阶判定会把它们全部挡掉。这里改用亮度下限 +
-     * 排除全透明，背景色（很暗）仍然会被放过。
-     */
-    private static boolean isProbablyIconColor(int c) {
-        int a = (c >>> 24) & 0xFF;
-        if (a < 0x40) return false;              // 几乎全透明 → 背景/占位
-        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-        int lum = (r * 299 + g * 587 + b * 114) / 1000;
-        return lum >= 0x60;                      // 太暗的放过（多为背景）
-    }
-
     /** 灰阶且亮 —— 系统浅色图标所用色域。 */
     private static boolean isIconColor(int c) {
         int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
@@ -1711,155 +1896,19 @@ public final class Hook {
     // ───────── 系统图标（信号/WiFi/电池）——按位置与通知图标区分
 
     /**
-     * 实测结论（来自用户反馈 v1.3 能改电量图标）：
-     * 右侧的信号、WiFi、电池图标 **也是 StatusBarIconView 实例**，
-     * 颜色通过 ImageView#setImageTintList 设置，而不是 Paint。
+     * 中性色（R=G=B）且非全透明 —— 视图级改色（文字 / 图标 tint）的判据。
      *
-     * 但 StatusBarIconView 同时承载两类东西：
-     *   - 左侧：通知图标（用户明确要求不要改）
-     *   - 右侧：系统图标（用户要求改）
-     *
-     * 两者的区分点是**水平位置**：系统图标固定在屏幕右半部分。
-     * 所以这里只对「中心点落在右半屏」的 StatusBarIconView 生效。
+     * 与 isIconColor 的唯一区别是**不要求够亮**：浅色背景下状态栏文字是
+     * 深色（如 #FF000000），用 isIconColor 会把这些全挡掉，「浅色背景」
+     * 那组配置就永远用不上。视图级的输入本身就是前景色（tint / textColor），
+     * 不会像 Paint#setColor 那样混入背景填充，所以可以放心放宽。
      */
-    private static void hookSystemIconTint(Class<?> iconViewCls) {
-        if (iconViewCls == null) { log("systemIconTint: no class"); return; }
-        try {
-            Class<?> csl = Class.forName("android.content.res.ColorStateList",
-                    false, iconViewCls.getClassLoader());
-
-            java.lang.reflect.Method mTint =
-                    iconViewCls.getMethod("setImageTintList", csl);
-            XposedBridge.hookMethod(mTint, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object self = param.thisObject;
-                        if (!(self instanceof View)) return;
-                        View v = (View) self;
-                        Object o = param.args[0];
-                        if (o == null) return;
-                        int cur = (Integer) o.getClass().getMethod("getDefaultColor").invoke(o);
-                        Integer r = tintArg(cur);
-                        if (r == null) return;
-
-                        java.lang.reflect.Constructor<?> ctor =
-                                o.getClass().getDeclaredConstructor(int.class);
-                        ctor.setAccessible(true);
-                        param.args[0] = ctor.newInstance(r.intValue());
-
-                        if (SYSTINT_HITS.incrementAndGet() <= 20) {
-                            log("[sys-tint@init] #" + Integer.toHexString(cur)
-                                    + " -> #" + Integer.toHexString(r));
-                        }
-                        // 关键：此时还没布局，坐标全是 0，必须再排一次
-                        scheduleRecolorAfterLayout(v);
-                    } catch (Throwable t) { logOnce("systint err " + t); }
-                }
-            });
-            log("hooked StatusBarIconView#setImageTintList (deferred by layout)");
-
-            java.lang.reflect.Method mCf = iconViewCls.getMethod("setColorFilter",
-                    int.class, Class.forName("android.graphics.PorterDuff$Mode",
-                            false, iconViewCls.getClassLoader()));
-            XposedBridge.hookMethod(mCf, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        Object self = param.thisObject;
-                        if (!(self instanceof View)) return;
-                        View v = (View) self;
-                        Object a0 = param.args[0];
-                        if (!(a0 instanceof Integer)) return;
-                        int cur = (Integer) a0;
-                        Integer out = tintArg(cur);
-                        if (out == null) return;
-                        param.args[0] = out;
-                        scheduleRecolorAfterLayout(v);
-                    } catch (Throwable ignored) {}
-                }
-            });
-            log("hooked StatusBarIconView#setColorFilter (deferred by layout)");
-        } catch (Throwable t) {
-            log("hookSystemIconTint failed: " + t);
-        }
+    private static boolean isNeutralColor(int c) {
+        int a = (c >>> 24) & 0xFF;
+        if (a < 0x10) return false;
+        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+        return r == g && g == b;
     }
-
-    /**
-     * 布局完成后再判定位置并改色。
-     *
-     * 为什么必须延迟：setImageTintList 是在 View 构造阶段调用的，
-     * 那时 getLeft()/getWidth() 还是 0，位置判定必然失败（v3.0 实测）。
-     * 用 post() 排到消息队列尾部，等布局完成再跑。
-     */
-    private static void scheduleRecolorAfterLayout(final View v) {
-        if (v == null || RECOLOR_SCHEDULED.contains(v)) return;
-        RECOLOR_SCHEDULED.add(v);
-        try {
-            v.post(new Runnable() {
-                @Override public void run() {
-                    try {
-                        if (!isSystemIcon(v)) return;
-                        Object d = v instanceof android.widget.ImageView
-                                ? ((android.widget.ImageView) v).getDrawable() : null;
-                        if (d == null) return;
-                        reTintDrawable(d);
-                        if (SYSTINT_HITS.incrementAndGet() <= 30) {
-                            log("[sys-apply] x=" + v.getLeft() + " w=" + v.getWidth()
-                                    + " cls=" + v.getClass().getSimpleName()
-                                    + " drawable=" + d.getClass().getSimpleName());
-                        }
-                    } catch (Throwable t) { logOnce("sys-apply err " + t); }
-                }
-            });
-        } catch (Throwable ignored) {}
-    }
-
-    /** 把 drawable 的 tint 换成配置颜色。 */
-    private static void reTintDrawable(Object d) throws Throwable {
-        try {
-            Object tl = d.getClass().getMethod("getTintList").invoke(d);
-            if (tl == null) return;
-            int cur = (Integer) tl.getClass().getMethod("getDefaultColor").invoke(tl);
-            Integer r = tintArg(cur);
-            if (r == null) return;
-            java.lang.reflect.Constructor<?> ctor = tl.getClass().getDeclaredConstructor(int.class);
-            ctor.setAccessible(true);
-            Object newTl = ctor.newInstance(r.intValue());
-            d.getClass().getMethod("setTintList",
-                    Class.forName("android.content.res.ColorStateList")).invoke(d, newTl);
-        } catch (Throwable ignored) {}
-    }
-
-    private static final java.util.Set<View> RECOLOR_SCHEDULED =
-            java.util.Collections.synchronizedSet(
-                    java.util.Collections.newSetFromMap(
-                            new java.util.WeakHashMap<View, Boolean>()));
-
-    /**
-     * 是不是「系统图标」：位于屏幕右半部分。
-     * 首次判定时把候选位置打出来，便于核对分界线。
-     */
-    private static boolean isSystemIcon(View v) {
-        try {
-            int screenW = v.getResources().getDisplayMetrics().widthPixels;
-            if (screenW <= 0) return false;
-            int w = v.getWidth();
-            if (w <= 0) return false;              // 还没布局，交给下一次
-            int cx = v.getLeft() + w / 2;
-            boolean right = cx > screenW / 2;
-
-            if (ICON_POS_LOGGED.incrementAndGet() <= 25) {
-                log("[icon-pos] x=" + v.getLeft() + " w=" + w
-                        + " cx=" + cx + " screenW=" + screenW
-                        + " -> " + (right ? "SYSTEM(右)" : "notification(左)"));
-            }
-            return right;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
-
-    private static final AtomicInteger SYSTINT_HITS = new AtomicInteger();
-    private static final AtomicInteger ICON_POS_LOGGED = new AtomicInteger();
 
     // ───────────── 状态栏 ImageView 的 tint（信号/WiFi/电池走这条）
 
@@ -1926,7 +1975,10 @@ public final class Hook {
                             int c0 = (Integer) o0.getClass()
                                     .getMethod("getDefaultColor").invoke(o0);
                             if (((c0 >>> 24) & 0xFF) == 0) return;
-                            Integer r0 = tintArg(c0);
+                            // HyperOS：浅色背景时框架给图标下发的是**深色** tint
+                            // （#bf0c0c0c 之类），tintArg() 的「够亮」条件会把它挡掉，
+                            // 所以 HyperOS 走 recolor() 的完整规则；ColorOS 保持 v11.4。
+                            Integer r0 = Rom.isHyperOs() ? recolor(c0) : tintArg(c0);
                             if (r0 == null) return;
                             if (r0.intValue() != c0) {
                                 param.args[0] = newCsl(o0, r0.intValue());
@@ -2106,44 +2158,6 @@ public final class Hook {
                 .invoke(null, Integer.valueOf(color));
     }
 
-    /**
-     * 已经先按状态栏改过色了，挂到窗口之后复核一次：
-     * 真在状态栏 → 什么都不做；不在（控制中心/锁屏）→ 还原成系统原色。
-     * 用 View.post：未 attach 时排进 run queue，attach 时执行。
-     */
-    private static final java.util.Set<View> VERIFYING =
-            java.util.Collections.synchronizedSet(
-                    java.util.Collections.newSetFromMap(
-                            new java.util.WeakHashMap<View, Boolean>()));
-
-    private static void verifyAfterAttach(final View v, final Object originalCsl) {
-        if (!VERIFYING.add(v)) return;
-        try {
-            v.post(new Runnable() {
-                @Override public void run() {
-                    VERIFYING.remove(v);
-                    try {
-                        if (isInStatusBarWindow(v)) {
-                            if (ICON_TINT_LOG.incrementAndGet() <= 30) {
-                                log("[icon-tint] attach 复核：在状态栏，保留改色");
-                            }
-                            return;
-                        }
-                        if (M_SET_TINT_LIST != null && originalCsl != null) {
-                            M_SET_TINT_LIST.invoke(v, originalCsl);
-                        }
-                        if (ICON_TINT_LOG.incrementAndGet() <= 30) {
-                            log("[icon-tint] attach 复核：不在状态栏，已还原 "
-                                    + v.getClass().getSimpleName());
-                        }
-                    } catch (Throwable t) {
-                        logOnce("verify err " + t);
-                    }
-                }
-            });
-        } catch (Throwable t) { logOnce("verify post err " + t); }
-    }
-
     private static final AtomicInteger ICON_TINT_LOG = new AtomicInteger();
 
     private static void logTintHit(View v, int cur, int out, String where) {
@@ -2221,14 +2235,14 @@ public final class Hook {
         if (cached != null && now - sCachedAt < CONF_TTL_MS) return cached;
 
         Conf c = readConfFile();
-        if (c != null) { once("conf source = FILE " + CONF_FILE); }
+        if (c != null) { once("conf source = FILE " + sConfPath); }
         else {
             c = readConfXsp(ctx);
             if (c != null) once("conf source = XSharedPreferences");
             else {
                 c = readConfSp(ctx);
                 if (c != null) once("conf source = SharedPreferences");
-                else once("conf UNREADABLE from all 3 sources");
+                else once("conf UNREADABLE from all sources");
             }
         }
         if (c != null) { sCachedConf = c; sCachedAt = now; }
@@ -2239,8 +2253,30 @@ public final class Hook {
         if (!sConfLogged) { sConfLogged = true; log(msg); }
     }
 
+    /** 上次读成功的那条路径；避免每秒都去碰被 SELinux 拒绝的路径。 */
+    private static volatile String sConfPath;
+
     private static Conf readConfFile() {
-        File f = new File(CONF_FILE);
+        String known = sConfPath;
+        if (known != null) {
+            Conf c = readConfFile(known);
+            if (c != null) return c;
+            sConfPath = null;
+        }
+        for (String p : confPaths()) {
+            if (p.equals(known)) continue;
+            Conf c = readConfFile(p);
+            if (c != null) {
+                if (sConfPath == null) log("conf file = " + p);
+                sConfPath = p;
+                return c;
+            }
+        }
+        return null;
+    }
+
+    private static Conf readConfFile(String path) {
+        File f = new File(path);
         if (!f.exists() || !f.canRead()) return null;
         BufferedReader br = null;
         try {
@@ -2316,6 +2352,31 @@ public final class Hook {
     }
 
     // ─────────────────────────────────────────────────────── 工具
+
+    // ── 供 HyperOsHooks 使用的包内桥接（保持主逻辑仍集中在本类）──
+
+    static Integer recolorShared(int original) {
+        return recolor(original);
+    }
+
+    static void logShared(String s) {
+        log(s);
+    }
+
+    private static final java.util.Set<String> LOGGED_ONCE =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    static void logOnceShared(String s) {
+        if (LOGGED_ONCE.add(s)) log(s);
+    }
+
+    static boolean inStatusBarWindowShared(View v) {
+        return isInStatusBarWindow(v);
+    }
+
+    static int scaleAlphaShared(int origAlpha, int cfgAlpha) {
+        return scaleAlphaBy(origAlpha, cfgAlpha);
+    }
 
     private static float luminance(int color) {
         float r = ((color >> 16) & 0xFF) / 255f;
