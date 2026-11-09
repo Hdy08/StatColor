@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.0";
+    public static final String VERSION = "12.0.1";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -515,6 +515,7 @@ public final class Hook {
         try {
             if (tv == null) return;
             if (!tv.getClass().getSimpleName().contains("Clock")) return;
+            if (!tv.isShown()) return;                // 隐藏的时钟不算
             if (inKeyguard(tv)) return;               // 锁屏时钟不算（颜色语境可能相反）
             if (((systemColor >>> 24) & 0xFF) == 0) return;
             if (!isNeutralColor(systemColor)) return;
@@ -524,6 +525,12 @@ public final class Hook {
             sSceneP = p;
             sSceneAt = android.os.SystemClock.uptimeMillis();
             SYNC_HELD.clear();                       // 新场景：下一次绘制重新冻结
+            if (Rom.isHyperOs()) {
+                // HyperOS 的电量要等它自己的 onDarkChanged 才换色，可能晚一两百毫秒
+                // （从设置返回桌面最明显）。先按新场景手动刷一遍，与文字同一帧生效。
+                sIconPolarity = p;
+                HyperOsHooks.refreshNow();
+            }
             log("[sync] clock #" + Integer.toHexString(systemColor)
                     + " → " + (p == 1 ? "深色背景" : "浅色背景") + "组");
         } catch (Throwable ignored) {}

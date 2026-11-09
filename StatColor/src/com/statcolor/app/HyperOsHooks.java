@@ -175,12 +175,62 @@ final class HyperOsHooks {
     static void onSweep(View v) {
         if (v == null) return;
         String cn = v.getClass().getName();
+        rememberView(v);
         if (CLS_BATTERY_VIEW.equals(cn)) {
             applyContainerInner(v);
         } else if (CLS_BATTERY_ICON.equals(cn)) {
             applyIcon(v, false);
         } else if (CLS_HOLLOW_ICON.equals(cn)) {
             applyHollow(v, false);
+        }
+    }
+
+    /** 见过的电量控件（弱引用），场景翻转时可以立刻重刷，不等系统的 dark 回调。 */
+    private static final java.util.Map<View, Boolean> KNOWN =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<View, Boolean>());
+
+    private static final AtomicInteger REFRESH_LOG = new AtomicInteger();
+
+    private static void rememberView(View v) {
+        if (v == null) return;
+        String cn = v.getClass().getName();
+        if (CLS_BATTERY_VIEW.equals(cn) || CLS_BATTERY_ICON.equals(cn)
+                || CLS_HOLLOW_ICON.equals(cn)) {
+            KNOWN.put(v, Boolean.TRUE);
+        }
+    }
+
+    /**
+     * 场景翻转（时钟先变色）时立刻按新场景重刷电量。
+     *
+     * 为什么需要：从设置返回桌面这类切换，状态栏文字/图标是立即换色的，
+     * 但 MIUI 的电量控件要等它自己的 onDarkChanged 回调 —— 可能晚一两百毫秒，
+     * 期间电量还停在旧场景的颜色上，看起来就是「电量慢半拍」。
+     * 这里直接拿已知控件重刷一遍，和文字同一帧生效。
+     */
+    static void refreshNow() {
+        java.util.List<View> list;
+        synchronized (KNOWN) {
+            list = new java.util.ArrayList<View>(KNOWN.keySet());
+        }
+        if (REFRESH_LOG.incrementAndGet() <= 8) {
+            Hook.logShared("[sync] refresh " + list.size()
+                    + " views p=#" + Integer.toHexString(Hook.barSeedShared()));
+        }
+        for (View v : list) {
+            try {
+                if (!Hook.inStatusBarWindowShared(v)) continue;
+                String cn = v.getClass().getName();
+                if (CLS_BATTERY_VIEW.equals(cn)) {
+                    applyContainerInner(v);
+                } else if (CLS_BATTERY_ICON.equals(cn)) {
+                    applyIcon(v, false);
+                } else if (CLS_HOLLOW_ICON.equals(cn)) {
+                    applyHollow(v, false);
+                }
+                v.invalidate();                   // 确保这一帧就重画（状态栏可能正在动画）
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -194,6 +244,7 @@ final class HyperOsHooks {
     }
 
     private static void applyContainerInner(View v) {
+        rememberView(v);
         Integer t = target();
         if (t == null) return;
         int target = t.intValue();
@@ -224,6 +275,7 @@ final class HyperOsHooks {
                 && Hook.inStatusBarWindowShared((View) icon))) {
             return false;
         }
+        if (icon instanceof View) rememberView((View) icon);
         Integer t = target();
         if (t == null) return false;
         int target = t.intValue();
@@ -273,6 +325,7 @@ final class HyperOsHooks {
                 && Hook.inStatusBarWindowShared((View) h))) {
             return false;
         }
+        if (h instanceof View) rememberView((View) h);
         Integer t = target();
         if (t == null) return false;
         int target = t.intValue();
