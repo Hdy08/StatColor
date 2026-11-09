@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.5.4";
+    public static final String VERSION = "12.0";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -419,6 +419,7 @@ public final class Hook {
                         Object a = param.args[0];
                         if (!(a instanceof Integer)) return;
                         int cur = (Integer) a;
+                        noteClockScene(tv, cur);
                         if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
                         Integer r = recolor(cur);
                         if (r == null || r.intValue() == cur) return;
@@ -464,6 +465,7 @@ public final class Hook {
                         } catch (Throwable ignored) {}
                         int cur = (Integer) o.getClass()
                                 .getMethod("getDefaultColor").invoke(o);
+                        noteClockScene(tv, cur);
                         if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
                         Integer r = recolor(cur);
                         if (r == null || r.intValue() == cur) return;
@@ -487,6 +489,78 @@ public final class Hook {
 
     private static final AtomicInteger TEXT_REMAP = new AtomicInteger();
     private static final AtomicInteger TEXT_GUARD = new AtomicInteger();
+
+    /**
+     * 场景最近一次翻转：1 浅色图标（深色背景）· 0 深色图标（浅色背景）· -1 未知。
+     *
+     * 由**状态栏时钟**的文字颜色驱动 —— 明暗切换时它总会立刻被系统设成纯白/纯黑，
+     * 是整条状态栏里最早、也最干净的信号。
+     */
+    private static volatile int sSceneP = -1;
+    private static volatile long sSceneAt;
+
+    /** 场景翻转后的「追平窗口」：这段时间内电量直接套用新场景的颜色组。 */
+    private static final long SCENE_SYNC_MS = 800;
+
+    /**
+     * 记录时钟的明暗翻转。
+     *
+     * 为什么不能只靠电量自己的颜色：ColorOS 切换明暗时会把电量图标的颜色
+     * **渐变**过去（实测 #4D000000 → #1CFFFFFF → #53FFFFFF → #4CFFFFFF 约 150ms），
+     * 而时钟/文字是立刻换色的 —— 于是电量看起来「慢半拍」。
+     * 拿到时钟这个先到的信号后，电量在 SCENE_SYNC_MS 内直接按新场景的组上色，
+     * 颜色就不跟着渐变了（透明度仍按系统动画走，视觉上不会跳）。
+     */
+    static void noteClockScene(android.widget.TextView tv, int systemColor) {
+        try {
+            if (tv == null) return;
+            if (!tv.getClass().getSimpleName().contains("Clock")) return;
+            if (inKeyguard(tv)) return;               // 锁屏时钟不算（颜色语境可能相反）
+            if (((systemColor >>> 24) & 0xFF) == 0) return;
+            if (!isNeutralColor(systemColor)) return;
+            float lum = luminance(systemColor);
+            int p = lum >= 0.85f ? 1 : (lum <= 0.15f ? 0 : -1);
+            if (p < 0 || p == sSceneP) return;
+            sSceneP = p;
+            sSceneAt = android.os.SystemClock.uptimeMillis();
+            SYNC_HELD.clear();                       // 新场景：下一次绘制重新冻结
+            log("[sync] clock #" + Integer.toHexString(systemColor)
+                    + " → " + (p == 1 ? "深色背景" : "浅色背景") + "组");
+        } catch (Throwable ignored) {}
+    }
+
+    /** 是否挂在锁屏窗口里（键屏的电量/时钟颜色语境和状态栏相反）。 */
+    private static boolean inKeyguard(View v) {
+        try {
+            View cur = v;
+            for (int i = 0; i < 16 && cur != null; i++) {
+                if (cur.getClass().getName().contains("Keyguard")) return true;
+                android.view.ViewParent p = cur.getParent();
+                cur = (p instanceof View) ? (View) p : null;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    /** 刚发生场景翻转时返回目标组的种子（白/黑）；否则 null。 */
+    private static Integer freshSceneSeed() {
+        int p = sSceneP;
+        if (p < 0) return null;
+        if (android.os.SystemClock.uptimeMillis() - sSceneAt > SCENE_SYNC_MS) return null;
+        return Integer.valueOf(p == 1 ? 0xFFFFFFFF : 0xFF000000);
+    }
+
+    /** 场景翻转后的短窗口：电量目标色冻结，避免跟着系统的颜色渐变动画走。 */
+    private static final long SCENE_FREEZE_MS = 300;
+
+    private static boolean inSceneFreeze() {
+        if (sSceneP < 0) return false;
+        return android.os.SystemClock.uptimeMillis() - sSceneAt <= SCENE_FREEZE_MS;
+    }
+
+    private static final java.util.Map<Object, int[]> SYNC_HELD =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, int[]>());
 
     private static void tintIcon(android.widget.ImageView iv) {
         try {
@@ -934,7 +1008,20 @@ public final class Hook {
             // 「随电量变化的那一份」不用下标猜：充电时它是唯一被系统染成
             // 高饱和状态色（绿/红）的参数，按颜色就能认出来。
             boolean charging = batteryIsCharging(inst, orig);
-            int[] desired = wantTint ? tintOf(orig, charging) : orig;
+            int[] desired;
+            if (wantTint && inSceneFreeze()) {
+                // 场景翻转后的 300ms：冻结目标色，不让电量跟着系统的颜色渐变动画走。
+                // 否则其它元素一帧就换完，电量却要淡 150ms 才到终值 —— 就是「慢半拍」。
+                int[] held = SYNC_HELD.get(inst);
+                if (held == null) {
+                    held = tintOf(orig, charging);
+                    if (held != null) SYNC_HELD.put(inst, held);
+                }
+                desired = held != null ? held : orig;
+            } else {
+                if (!wantTint) SYNC_HELD.remove(inst);
+                desired = wantTint ? tintOf(orig, charging) : orig;
+            }
             if (desired == null) desired = orig;
             if (sameColors(BATT_APPLIED.get(inst), desired)) {
                 // 颜色没变也要摆正闪电：控制中心那支 drawable 和状态栏这支
@@ -1417,14 +1504,20 @@ public final class Hook {
      * 它们才是「状态栏现在这个透明度」的真实来源，而且自动跟着深浅模式变。
      */
     private static int[] tintOf(int[] orig, boolean charging) {
-        int statusA = statusBarAlpha(orig);       // 同一支 drawable 里中性色用的透明度
+        // 场景刚翻转（时钟先变）：整支电量直接按新场景的组上色，
+        // 不再跟着系统的颜色渐变慢慢走 —— 这就是「电量慢半拍」的修法。
+        Integer seed = freshSceneSeed();
+        Integer sceneTheme = seed == null ? null : recolor(seed.intValue());
+        int statusA = sceneTheme != null
+                ? ((sceneTheme.intValue() >>> 24) & 0xFF)
+                : statusBarAlpha(orig);           // 同一支 drawable 里中性色用的透明度
 
         int[] out = new int[3];
         for (int i = 0; i < 3; i++) {
             int cur = orig[i];
             int a = (cur >>> 24) & 0xFF;
             if (a == 0) { out[i] = cur; continue; }          // 全透明占位不动
-            Integer r = recolor(cur);
+            Integer r = sceneTheme != null ? sceneTheme : recolor(cur);
             if (r == null) { out[i] = cur; continue; }
             int theme = r.intValue();
             if (isSystemStatusColor(cur)) {
@@ -1457,6 +1550,8 @@ public final class Hook {
      * 全局记下来就会 1~2 秒翻一次，闪电在两组颜色之间来回闪（实测）。
      */
     private static int statusBarSeed(int[] orig) {
+        Integer scene = freshSceneSeed();             // 场景刚翻转：听时钟的
+        if (scene != null) return scene.intValue();
         if (orig != null) {
             for (int c : orig) {
                 if (((c >>> 24) & 0xFF) == 0) continue;
