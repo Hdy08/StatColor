@@ -81,8 +81,23 @@ final class HyperOsHooks {
             String nm = m.getName();
             int pc = m.getParameterTypes().length;
             if ("onDarkChanged".equals(nm) && pc == 6) {
-                hookAfter(m, new BatteryHandler("onDarkChanged/6") {
-                    @Override void handle(Object self) { applyContainer(self); }
+                hookAfter(m, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            Object self = p.thisObject;
+                            // 只认状态栏那一个实例：锁屏 / AOD 用的是同名控件的
+                            // 另一个实例，它们的前景色可能是相反的。
+                            if (self instanceof View
+                                    && Hook.inStatusBarWindowShared((View) self)
+                                    && p.args[2] instanceof Integer) {
+                                Hook.noteBarTint(((Integer) p.args[2]).intValue(),
+                                        "onDarkChanged");
+                            }
+                            applyContainer(self);
+                        } catch (Throwable t) {
+                            Hook.logOnceShared("hyperos onDarkChanged err " + t);
+                        }
+                    }
                 });
                 hooked++;
             } else if ("onDarkChangedInternal".equals(nm) && pc == 0) {
@@ -106,10 +121,7 @@ final class HyperOsHooks {
             if ("onDarkChangeInternal".equals(m.getName())
                     && m.getParameterTypes().length == 0) {
                 hookAfter(m, new BatteryHandler("icon.onDarkChangeInternal") {
-                    @Override void handle(Object self) {
-                        Integer t = target();
-                        if (t != null) applyIcon(self, t.intValue(), true);
-                    }
+                    @Override void handle(Object self) { applyIcon(self, true); }
                 });
                 hooked++;
             }
@@ -129,10 +141,7 @@ final class HyperOsHooks {
             if ("updateBatteryDrawable".equals(m.getName())
                     && m.getParameterTypes().length == 0) {
                 hookAfter(m, new BatteryHandler("hollow.updateBatteryDrawable") {
-                    @Override void handle(Object self) {
-                        Integer t = target();
-                        if (t != null) applyHollow(self, t.intValue(), true);
-                    }
+                    @Override void handle(Object self) { applyHollow(self, true); }
                 });
                 hooked++;
             }
@@ -166,15 +175,12 @@ final class HyperOsHooks {
     static void onSweep(View v) {
         if (v == null) return;
         String cn = v.getClass().getName();
-        Integer t = target();
-        if (t == null) return;
-        int target = t.intValue();
         if (CLS_BATTERY_VIEW.equals(cn)) {
-            applyContainerInner(v, target);
+            applyContainerInner(v);
         } else if (CLS_BATTERY_ICON.equals(cn)) {
-            applyIcon(v, target, false);
+            applyIcon(v, false);
         } else if (CLS_HOLLOW_ICON.equals(cn)) {
-            applyHollow(v, target, false);
+            applyHollow(v, false);
         }
     }
 
@@ -184,12 +190,14 @@ final class HyperOsHooks {
         if (!(self instanceof View)) return;
         View v = (View) self;
         if (!Hook.inStatusBarWindowShared(v)) return;      // 锁屏 / AOD 不碰
-        Integer t = target();
-        if (t == null) return;
-        applyContainerInner(v, t.intValue());
+        applyContainerInner(v);
     }
 
-    private static void applyContainerInner(View v, int target) {
+    private static void applyContainerInner(View v) {
+        Integer t = target();
+        if (t == null) return;
+        int target = t.intValue();
+
         // 闪电（独立 ImageView，tint 由 onDarkChangedInternal 下发）
         Object charging = get(v, "mBatteryChargingView");
         if (charging instanceof ImageView) {
@@ -200,8 +208,8 @@ final class HyperOsHooks {
         setTextColor(get(v, "mBatteryPercentMarkView"), target);
 
         // 图标本体 + 空心样式
-        applyIcon(get(v, "mBatteryIconView"), target, false);
-        applyHollow(get(v, "mHollowBatteryIconView"), target, false);
+        applyIcon(get(v, "mBatteryIconView"), false);
+        applyHollow(get(v, "mHollowBatteryIconView"), false);
     }
 
     /**
@@ -210,12 +218,15 @@ final class HyperOsHooks {
      *        它们也会走 onDarkChangeInternal，不判窗口就会把锁屏一起改掉。
      *        扫描路径传 false：扫描本来就从状态栏根视图出发。
      */
-    private static boolean applyIcon(Object icon, int target, boolean requireStatusBar) {
+    private static boolean applyIcon(Object icon, boolean requireStatusBar) {
         if (icon == null) return false;
         if (requireStatusBar && !(icon instanceof View
                 && Hook.inStatusBarWindowShared((View) icon))) {
             return false;
         }
+        Integer t = target();
+        if (t == null) return false;
+        int target = t.intValue();
 
         boolean charging = getBool(icon, "mCharging") || getBool(icon, "mQuickCharging");
         boolean low = getBool(icon, "mLow");
@@ -249,18 +260,22 @@ final class HyperOsHooks {
             if (icon instanceof View) ((View) icon).invalidate();
             if (BATT_LOG.incrementAndGet() <= 12) {
                 Hook.logShared("[hyperos-batt] " + state(charging, low, save, perf)
+                        + " seed=#" + hex(Hook.barSeedShared())
                         + " bg=#" + hex(target) + " prog=#" + hex(progColor));
             }
         }
         return changed;
     }
 
-    private static boolean applyHollow(Object h, int target, boolean requireStatusBar) {
+    private static boolean applyHollow(Object h, boolean requireStatusBar) {
         if (h == null) return false;
         if (requireStatusBar && !(h instanceof View
                 && Hook.inStatusBarWindowShared((View) h))) {
             return false;
         }
+        Integer t = target();
+        if (t == null) return false;
+        int target = t.intValue();
         boolean charging = getBool(h, "charging") || getBool(h, "quickCharging");
         boolean low = getBool(h, "low");
         boolean save = getBool(h, "powerSave");
@@ -316,9 +331,9 @@ final class HyperOsHooks {
         return "charging=" + charging + " low=" + low + " save=" + save + " perf=" + perf;
     }
 
-    /** 配置色（以中性白为输入，交给 Hook 的明暗/透明度规则换算）。 */
+    /** 配置色（种子取自状态栏当前明暗，交给 Hook 的选组 / 透明度规则换算）。 */
     private static Integer target() {
-        return Hook.recolorShared(0xFFFFFFFF);
+        return Hook.recolorShared(Hook.barSeedShared());
     }
 
     /**
@@ -343,24 +358,39 @@ final class HyperOsHooks {
         if (!(tv instanceof TextView)) return;
         try {
             TextView t = (TextView) tv;
-            if (t.getCurrentTextColor() != color) t.setTextColor(color);
+            if (t.getCurrentTextColor() == color) return;
+            Hook.beginSelfApply();
+            try { t.setTextColor(color); } finally { Hook.endSelfApply(); }
         } catch (Throwable ignored) {}
     }
 
     /**
      * 读 Drawable 当前的 tint 颜色。
      *
-     * 注意：android.jar 的公开 stub 里 Drawable **没有** getTintList()
-     * （只有 setTint/setTintList），直接调编译不过，只能反射。
+     * 注意两点：
+     *  - android.jar 的公开 stub 里 Drawable **没有** getTintList()（它是
+     *    @hide 的公开方法），直接调编译不过，只能反射；
+     *  - MIUI 的 drawable 子类往往不是 public，直接 getMethod + invoke 会抛
+     *    IllegalAccessException（这就是 v11.5 里 tint 恒为 null、每次扫描都
+     *    重建一遍位图的原因），所以必须先 setAccessible。
      */
     private static Integer tintOf(Drawable d) {
         if (d == null) return null;
-        try {
-            Object v = d.getClass().getMethod("getTintList").invoke(d);
-            if (v instanceof ColorStateList) {
-                return Integer.valueOf(((ColorStateList) v).getDefaultColor());
+        for (Class<?> c = d.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                Method m = c.getDeclaredMethod("getTintList");
+                m.setAccessible(true);
+                Object v = m.invoke(d);
+                if (v instanceof ColorStateList) {
+                    return Integer.valueOf(((ColorStateList) v).getDefaultColor());
+                }
+                return null;
+            } catch (NoSuchMethodException ignored) {
+                // 继续往父类找
+            } catch (Throwable t) {
+                return null;
             }
-        } catch (Throwable ignored) {}
+        }
         return null;
     }
 

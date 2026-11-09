@@ -2,15 +2,18 @@
 
 一个 LSPosed 模块，用来**统一修改 ColorOS / OxygenOS 与 HyperOS 状态栏上所有元素的颜色与透明度**（通知图标除外）。
 
-v11.5 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
+v11.5.2 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
 再选择对应的着色通道 —— 同一份 APK 在两类 ROM 上都能用。
+
+> v11.5.2 修复：两类 ROM 的电量图标在「浅色状态栏」下都会误用「深色背景」那组配置色 ——
+> HyperOS 是未充电时的电池外框，ColorOS 是**充电时**的闪电（详见下文「颜色组：跟随状态栏明暗」）。
 
 实测环境：
 
 | ROM | 机型 | 版本 |
 |---|---|---|
-| ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3 开发验证 |
-| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5 开发验证（OS3.0.8.0.VLRCNXM） |
+| ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3；v11.5.2 充电闪电验证 |
+| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证（OS3.0.8.0.VLRCNXM） |
 
 作用域固定为 `com.android.systemui`（两类 ROM 的 SystemUI 都是这个包名）。
 
@@ -44,7 +47,7 @@ v11.5 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断�
 判定结果写进日志，一眼就能确认模块走的是哪条通道：
 
 ```
-StatColor: === v11.5 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
+StatColor: === v11.5.2 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
 StatColor: hyperos: com.android.systemui.statusbar.views.MiuiBatteryMeterView hooks=2
 ```
 
@@ -201,6 +204,37 @@ MiuiBatteryMeterView (LinearLayout)
 `firstBackground` / `secondBackground` / `thirdBackground` 的 tint 与 `textPaint` 颜色，
 再调 `updateFirstBitmap()` / `updateSecondBitmap()` 重建。
 
+#### 颜色组：跟随状态栏明暗（v11.5.2 修复）
+
+配置里有两组颜色：`color_dark`（深色背景 → 浅色图标）与 `color_light`（浅色背景 → 深色图标）。
+选哪一组由 `recolor()` 按**输入色的亮度**决定 —— 文字、WiFi、信号拿到的都是系统下发的
+真实前景色（深色背景下发白，浅色背景下发黑），所以天然选对。
+
+但两类 ROM 的电量图标都要额外给一个"种子"（我们拿不到它的前景色）：
+
+| 通道 | 错误（v11.5.1 及以前） | 现在 |
+|---|---|---|
+| HyperOS | `recolor(0xFFFFFFFF)` 写死白色 → 永远是「深色背景」组 | 取 `MiuiBatteryMeterView#onDarkChanged(...)` 第 3 个参数（系统算好的图标前景色：深色背景 `#E6FFFFFF` / 浅色背景 `#BF000000`） |
+| ColorOS | 闪电 `tintChargeBolt()` 同样写死白色 → **充电时浅色状态栏的闪电变成深色组的颜色** | 用同一支 drawable 的系统原始色推断（底环 / 边框仍是中性色：白系 = 深色背景，黑系 = 浅色背景） |
+
+极性记在 `Hook.sIconPolarity`，`barSeedShared()` 返回白/黑种子；两者都拿不到时退回
+系统深色模式设置，再不行按「深色背景」处理（与旧行为一致）。
+
+两个坑，都是实测踩出来的：
+
+- **不能拿状态栏文字反推**：MIUI 会把锁屏 / 被遮挡的时钟一起刷，两个实例颜色相反时
+  极性会 1Hz 来回跳；`NetworkSpeedView` 更是每秒用 `#CCFFFFFF` 和 `#BF000000` 交替设色。
+  表现就是电池在两组颜色之间闪（v11.5.1 调试实测）。
+- **只能认状态栏那个实例**：锁屏 / AOD 用的是同名电量控件的另一个实例，
+  `onDarkChanged` 的参数可能整好相反，必须先用 `inStatusBarWindow()` 判窗口。
+
+极性每次变化都会打一行日志：
+
+```
+StatColor: [bar] #ff000000 from onDarkChanged 深色图标（浅色背景）→ 用「浅色背景」组
+StatColor: [bar] #ffffffff from batt-orig 浅色图标（深色背景）→ 用「深色背景」组
+```
+
 ---
 
 ## 构建
@@ -342,7 +376,7 @@ FindRefs.java / findrefs.sh              扫描"谁引用了某个方法/字段"
 
 因此 minSdk 提到 **31**（`Theme.DeviceDefault.DayNight` 自 API 29 起才存在），targetSdk 34。
 
-v11.5 起，日志区首行会显示 `模块版本 11.5 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
+v11.5 起，日志区首行会显示 `模块版本 11.5.2 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
 保存后会把**两条配置路径**的写入结果与内容都打到日志里。
 
 ---
@@ -403,13 +437,14 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 
 | 标记 | 含义 |
 |---|---|
-| `=== v11.5 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
+| `=== v11.5.2 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
 | `hyperos: ... hooks=N` | HyperOS 电量相关钩子挂载数量（`MISS` 表示该类不存在，ROM 可能变了） |
 | `conf file = ...` / `conf source = ...` | 配置实际用的哪条路径（HyperOS 应为 `/data/system/statcolor.conf`） |
 | `[sweep] ...` / `[sweep-skip] ...` / `[sweep-text] ...` | 视图树扫描改色 / 因位置被跳过 / 文字改色 |
 | `[icon-tint] known-icon ...` | 快路径命中，框架重设 tint 被当帧拦下 |
 | `[text-color] ...` / `[flicker-guard] #N ...` | 文字颜色在源头被改写 / 系统试图把已改色文字打回原色（防闪烁计数） |
-| `[hyperos-batt] ... charging=... low=...` | HyperOS 电量图标的判定与目标色 |
+| `[hyperos-batt] ... charging=... low=...` | HyperOS 电量图标的判定与目标色（`seed=` 为选组依据） |
+| `[bar] #... from ...` | 状态栏明暗极性变化，决定电量用「深色背景」还是「浅色背景」那组颜色 |
 | `[hyperos-hollow] ...` | 空心电量样式的处理 |
 | `[batt-draw] ... charging=true/false` | ColorOS 电量图标的充电判定结果 |
 | `[batt-bolt] bolt ...` | ColorOS 闪电上色 / 透明度 |

@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.5";
+    public static final String VERSION = "11.5.2";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -343,6 +343,13 @@ public final class Hook {
 
     private static final AtomicInteger TEXT_HITS = new AtomicInteger();
 
+    /**
+     * 「这次 setTextColor 是本模块自己刷的」标记（线程内）。
+     * 极性判定只认系统下发的颜色，自己的颜色若被当成系统色，
+     * 配置里选白色时会把极性判反，然后两组颜色来回倒。
+     */
+    private static final ThreadLocal<Boolean> SELF_APPLY = new ThreadLocal<Boolean>();
+
     /** 已确认属于状态栏的 TextView（弱引用，避免长期持有视图）。 */
     private static final java.util.Set<android.widget.TextView> SB_TEXT_VIEWS =
             java.util.Collections.synchronizedSet(
@@ -369,7 +376,8 @@ public final class Hook {
             if (r == null) return;
             int out = r.intValue();
             if (out == cur) return;
-            tv.setTextColor(out);
+            SELF_APPLY.set(Boolean.TRUE);
+            try { tv.setTextColor(out); } finally { SELF_APPLY.remove(); }
             if (TEXT_HITS.incrementAndGet() <= 15) {
                 log("[sweep-text] " + tv.getClass().getSimpleName()
                         + " #" + Integer.toHexString(cur)
@@ -407,6 +415,7 @@ public final class Hook {
                         if (!(self instanceof android.widget.TextView)) return;
                         android.widget.TextView tv = (android.widget.TextView) self;
                         if (!isStatusBarText(tv)) return;
+                        if (SELF_APPLY.get() != null) return;   // 本模块自己刷的色，不作极性依据
                         Object a = param.args[0];
                         if (!(a instanceof Integer)) return;
                         int cur = (Integer) a;
@@ -445,6 +454,7 @@ public final class Hook {
                         if (!(self instanceof android.widget.TextView)) return;
                         android.widget.TextView tv = (android.widget.TextView) self;
                         if (!isStatusBarText(tv)) return;
+                        if (SELF_APPLY.get() != null) return;   // 本模块自己刷的色，不作极性依据
                         Object o = param.args[0];
                         if (o == null) return;
                         // 有状态的颜色（按下/禁用）保留原样
@@ -1305,7 +1315,9 @@ public final class Hook {
         if (Boolean.TRUE.equals(BATT_APPLYING.get())) return;
         BATT_APPLYING.set(Boolean.TRUE);
         try {
-            Integer r = recolor(0xFFFFFFFF);          // 以白色为基准取「深色背景」那组色
+            // 种子必须取「状态栏当前明暗」，不能固定传白：充电时浅色状态栏
+            // 的闪电会因此变成「深色背景」那组配置色（v11.5.1 反馈的问题）。
+            Integer r = recolor(statusBarSeed(BATT_ORIG.get(inst)));
             if (r == null) return;
             final int want = r.intValue();
             final int cfgA = (want >>> 24) & 0xFF;
@@ -1427,8 +1439,34 @@ public final class Hook {
     }
 
     /**
+     * 从同一支电量 drawable 的系统原始色里推断「状态栏现在是深色还是浅色背景」。
+     *
+     * 充电时 p1 是绿色（状态色），但底环 / 边框仍是系统给的中性色：
+     * 深色背景 → 白系（#4DFFFFFF / #CCFFFFFF），浅色背景 → 黑系（#4D000000）。
+     * 拿它当 recolor() 的种子，闪电才会用对那一组配置色。
+     */
+    private static int statusBarSeed(int[] orig) {
+        if (orig != null) {
+            for (int c : orig) {
+                if (((c >>> 24) & 0xFF) == 0) continue;
+                if (isSystemStatusColor(c)) continue;
+                int rgb = c & 0x00FFFFFF;
+                if (rgb == 0x00FFFFFF) {                      // 白系 → 深色背景
+                    noteBarTint(0xFFFFFFFF, "batt-orig");
+                    return 0xFFFFFFFF;
+                }
+                if (rgb == 0x000000) {                        // 黑系 → 浅色背景
+                    noteBarTint(0xFF000000, "batt-orig");
+                    return 0xFF000000;
+                }
+            }
+        }
+        return barSeedShared();
+    }
+
+    /**
      * 这一组电量颜色里，状态栏正在用的透明度 —— 取自中性色（底环 / 边框 / 闪电底）。
-     * 全是状态色（理论上不会）时退回最近一次记住的值，再退回「深色背景」那组。
+     * 全是状态色（理论上不会）时退回最近一次记住的值，再退回配置的透明度。
      */
     private static int statusBarAlpha(int[] orig) {
         for (int i = 0; i < orig.length; i++) {
@@ -1456,9 +1494,9 @@ public final class Hook {
         return a > 255 ? 255 : a;
     }
 
-    /** 配置的透明度（取「深色背景」那组，状态栏就是这个语境）。 */
+    /** 配置的透明度（跟着状态栏当前明暗取组）。 */
     private static int configAlpha() {
-        Integer t = recolor(0xFFFFFFFF);          // 亮度 1.0 → 深色组
+        Integer t = recolor(barSeedShared());
         return t == null ? 0xFF : ((t.intValue() >>> 24) & 0xFF);
     }
 
@@ -2217,6 +2255,74 @@ public final class Hook {
         return Integer.valueOf(out);
     }
 
+    // ───────────────────────────────────────── 状态栏明暗极性（选哪组配置色）
+
+    /**
+     * 状态栏当前是「浅色图标（深色背景）」还是「深色图标（浅色背景）」。
+     *   -1 未知 · 1 浅色图标（深色背景）· 0 深色图标（浅色背景）
+     *
+     * 为什么需要它
+     * ------------
+     * recolor() 靠**输入色本身的亮度**选组。文字、WiFi、信号拿到的都是
+     * 系统下发的真实前景色（深色背景 → 白，浅色背景 → 黑），所以天然正确。
+     *
+     * 但 HyperOS 的电量图标是自绘控件：颜色在 onDarkChangeInternal() 里由
+     * 它自己算，我们改色时手上没有「当前前景色」，只能给 recolor() 一个种子。
+     * v11.5 之前固定传白 —— 于是永远落到「深色背景」那组：
+     * 浅色状态栏下电池用的是**深色配置**（实测配置 #5FFFFFFF 时，
+     * 浅色状态栏上是一团半透明白，几乎看不见，正是本次要修的问题）。
+     *
+     * 修法：HyperOS 的 `MiuiBatteryMeterView#onDarkChanged(...)` 第 3 个参数
+     * 就是系统给状态栏图标算好的前景色（深色背景 #E6FFFFFF / 浅色背景
+     * #BF000000），在状态栏那个实例上直接拿它当种子即可。
+     *
+     * 不能用「时钟文字颜色」反推：MIUI 会把锁屏/被遮挡的时钟也一起刷，
+     * 两个实例颜色相反时极性会 1Hz 来回跳，电量就在两组颜色之间闪。
+     */
+    private static volatile int sIconPolarity = -1;
+
+    /**
+     * 记录一个**系统下发**的前景色，据此更新状态栏明暗极性。
+     * 只认接近纯白 / 纯黑的颜色：灰和自定义主题色都可能落在中间，
+     * 拿它们判极性会把颜色组判反。
+     */
+    static void noteBarTint(int systemColor, String who) {
+        if (((systemColor >>> 24) & 0xFF) == 0) return;     // 全透明不算
+        if (!isNeutralColor(systemColor)) return;           // 状态色（红/绿/黄）不算
+        float lum = luminance(systemColor);
+        int p;
+        if (lum >= 0.85f) p = 1;                            // 白 → 深色背景
+        else if (lum <= 0.15f) p = 0;                       // 黑 → 浅色背景
+        else return;
+        if (p == sIconPolarity) return;
+        sIconPolarity = p;
+        log("[bar] #" + Integer.toHexString(systemColor) + " from " + who
+                + (p == 1 ? " 浅色图标（深色背景）→ 用「深色背景」组"
+                          : " 深色图标（浅色背景）→ 用「浅色背景」组"));
+    }
+
+    /**
+     * 给自绘控件（HyperOS 电量）用的颜色种子：
+     * 白 = 深色背景（浅色图标），黑 = 浅色背景（深色图标）。
+     *
+     * 还不知道极性时退回系统深色模式设置 —— 不完美（应用可以单独要求
+     * 浅色状态栏），但比固定白准。
+     */
+    static int barSeedShared() {
+        int p = sIconPolarity;
+        if (p < 0) {
+            try {
+                Context ctx = sCtx;
+                if (ctx != null) {
+                    int mode = ctx.getResources().getConfiguration().uiMode
+                            & android.content.res.Configuration.UI_MODE_NIGHT_MASK;
+                    p = (mode == android.content.res.Configuration.UI_MODE_NIGHT_NO) ? 0 : 1;
+                }
+            } catch (Throwable ignored) {}
+        }
+        return p == 0 ? 0xFF000000 : 0xFFFFFFFF;
+    }
+
     // ─────────────────────────────────────────────────────── 配置读取
 
     private static final class Conf {
@@ -2376,6 +2482,15 @@ public final class Hook {
 
     static int scaleAlphaShared(int origAlpha, int cfgAlpha) {
         return scaleAlphaBy(origAlpha, cfgAlpha);
+    }
+
+    /** 标记「接下来的 setTextColor 是本模块自己刷的」（供 HyperOsHooks 用）。 */
+    static void beginSelfApply() {
+        SELF_APPLY.set(Boolean.TRUE);
+    }
+
+    static void endSelfApply() {
+        SELF_APPLY.remove();
     }
 
     private static float luminance(int color) {
