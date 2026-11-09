@@ -124,6 +124,22 @@ final class HyperOsHooks {
                     @Override void handle(Object self) { applyIcon(self, true); }
                 });
                 hooked++;
+            } else if ("updateProgressBackgroundBitmap".equals(m.getName())
+                    && m.getParameterTypes().length == 0) {
+                // 烘焙前再摆一次 tint：MIUI 的 dark 回调会先 setTintList(系统色)
+                // 再调它烘焙，偶尔就出现「闪一下旧色」；在烘焙前改回来最稳。
+                hookBefore(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Object self = p.thisObject;
+                            if (self instanceof View
+                                    && Hook.inStatusBarWindowShared((View) self)) {
+                                paintIconTints(self);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                });
+                hooked++;
             }
         }
         Hook.logShared("hyperos: " + CLS_BATTERY_ICON + " hooks=" + hooked);
@@ -142,6 +158,22 @@ final class HyperOsHooks {
                     && m.getParameterTypes().length == 0) {
                 hookAfter(m, new BatteryHandler("hollow.updateBatteryDrawable") {
                     @Override void handle(Object self) { applyHollow(self, true); }
+                });
+                hooked++;
+            } else if (("updateFirstBitmap".equals(m.getName())
+                    || "updateSecondBitmap".equals(m.getName()))
+                    && m.getParameterTypes().length == 0) {
+                // 与图标那条同理：系统重置 tint 后要烘焙位图，烘焙前摆正颜色。
+                hookBefore(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Object self = p.thisObject;
+                            if (self instanceof View
+                                    && Hook.inStatusBarWindowShared((View) self)) {
+                                paintHollowTints(self);
+                            }
+                        } catch (Throwable ignored) {}
+                    }
                 });
                 hooked++;
             }
@@ -284,20 +316,7 @@ final class HyperOsHooks {
         boolean low = getBool(icon, "mLow");
         boolean save = getBool(icon, "mPowerSave");
         boolean perf = getBool(icon, "mPerformanceMode");
-        int cfgA = (target >>> 24) & 0xFF;
-
-        int progColor;
-        if (charging) {
-            progColor = keepHue(getInt(icon, "mBatteryChargingColor"), cfgA, target);
-        } else if (low) {
-            progColor = keepHue(getInt(icon, "mBatteryLowColor"), cfgA, target);
-        } else if (save) {
-            progColor = keepHue(getInt(icon, "mBatteryPowerSaveColor"), cfgA, target);
-        } else if (perf) {
-            progColor = keepHue(getInt(icon, "mBatteryPerformanceModeColor"), cfgA, target);
-        } else {
-            progColor = target;
-        }
+        int progColor = iconProgColor(icon, target);
 
         boolean changed = false;
         Drawable bg = getDrawable(icon, "mTintBgDrawable");
@@ -319,6 +338,70 @@ final class HyperOsHooks {
         return changed;
     }
 
+    /**
+     * 电量填充色（外框始终用 target）。
+     * 充电 / 低电量 / 省电 / 高性能这些系统状态色只缩 alpha、保留色相。
+     */
+    private static int iconProgColor(Object icon, int target) {
+        int cfgA = (target >>> 24) & 0xFF;
+        if (getBool(icon, "mCharging") || getBool(icon, "mQuickCharging")) {
+            return keepHue(getInt(icon, "mBatteryChargingColor"), cfgA, target);
+        }
+        if (getBool(icon, "mLow")) {
+            return keepHue(getInt(icon, "mBatteryLowColor"), cfgA, target);
+        }
+        if (getBool(icon, "mPowerSave")) {
+            return keepHue(getInt(icon, "mBatteryPowerSaveColor"), cfgA, target);
+        }
+        if (getBool(icon, "mPerformanceMode")) {
+            return keepHue(getInt(icon, "mBatteryPerformanceModeColor"), cfgA, target);
+        }
+        return target;
+    }
+
+    /**
+     * 只摆正两层 tint，不重建位图。
+     *
+     * 挂在 `updateProgressBackgroundBitmap()` 之前用：不管是谁触发的重建
+     * （MIUI 的 dark 回调、我们自己的刷新、布局变化），烘焙进位图的都是这一套颜色，
+     * 不会再出现「系统拿旧色烘焙 → 下一帧才被我们改回来」的偶发闪一下。
+     */
+    private static void paintIconTints(Object icon) {
+        Integer t = target();
+        if (t == null) return;
+        int target = t.intValue();
+        setTint(getDrawable(icon, "mTintBgDrawable"), target);
+        setTint(getDrawable(icon, "mProgressClipDrawable"), iconProgColor(icon, target));
+    }
+
+    /** 空心样式第二层的颜色（充电/低电量等系统状态色只缩 alpha）。 */
+    private static int hollowSecondColor(Object h, int target) {
+        int cfgA = (target >>> 24) & 0xFF;
+        if (getBool(h, "charging") || getBool(h, "quickCharging")) {
+            return keepHue(getInt(h, "batteryChargingColor"), cfgA, target);
+        }
+        if (getBool(h, "low")) {
+            return keepHue(getInt(h, "batteryLowColor"), cfgA, target);
+        }
+        if (getBool(h, "powerSave")) {
+            return keepHue(getInt(h, "batteryPowerSaveColor"), cfgA, target);
+        }
+        if (getBool(h, "performanceMode")) {
+            return keepHue(getInt(h, "batteryPerformanceModeColor"), cfgA, target);
+        }
+        return target;
+    }
+
+    /** 只摆正空心样式的 tint（重建位图前调用）。 */
+    private static void paintHollowTints(Object h) {
+        Integer t = target();
+        if (t == null) return;
+        int target = t.intValue();
+        setTint(getDrawable(h, "firstBackground"), target);
+        setTint(getDrawable(h, "secondBackground"), hollowSecondColor(h, target));
+        setTint(getDrawable(h, "thirdBackground"), target);
+    }
+
     private static boolean applyHollow(Object h, boolean requireStatusBar) {
         if (h == null) return false;
         if (requireStatusBar && !(h instanceof View
@@ -333,20 +416,7 @@ final class HyperOsHooks {
         boolean low = getBool(h, "low");
         boolean save = getBool(h, "powerSave");
         boolean perf = getBool(h, "performanceMode");
-        int cfgA = (target >>> 24) & 0xFF;
-
-        int secondColor;
-        if (charging) {
-            secondColor = keepHue(getInt(h, "batteryChargingColor"), cfgA, target);
-        } else if (low) {
-            secondColor = keepHue(getInt(h, "batteryLowColor"), cfgA, target);
-        } else if (save) {
-            secondColor = keepHue(getInt(h, "batteryPowerSaveColor"), cfgA, target);
-        } else if (perf) {
-            secondColor = keepHue(getInt(h, "batteryPerformanceModeColor"), cfgA, target);
-        } else {
-            secondColor = target;
-        }
+        int secondColor = hollowSecondColor(h, target);
 
         boolean changed = false;
         changed |= setTint(getDrawable(h, "firstBackground"), target);
@@ -470,6 +540,15 @@ final class HyperOsHooks {
             return Class.forName(name, false, cl);
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    private static void hookBefore(Method m, XC_MethodHook hook) {
+        try {
+            m.setAccessible(true);
+            XposedBridge.hookMethod(m, hook);
+        } catch (Throwable t) {
+            Hook.logShared("hyperos: hook " + m.getName() + " failed: " + t);
         }
     }
 

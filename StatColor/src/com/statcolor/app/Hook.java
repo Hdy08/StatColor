@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.0.1";
+    public static final String VERSION = "12.0.2";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -515,7 +515,6 @@ public final class Hook {
         try {
             if (tv == null) return;
             if (!tv.getClass().getSimpleName().contains("Clock")) return;
-            if (!tv.isShown()) return;                // 隐藏的时钟不算
             if (inKeyguard(tv)) return;               // 锁屏时钟不算（颜色语境可能相反）
             if (((systemColor >>> 24) & 0xFF) == 0) return;
             if (!isNeutralColor(systemColor)) return;
