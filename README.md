@@ -2,10 +2,10 @@
 
 一个 LSPosed 模块，用来**统一修改 ColorOS / OxygenOS 与 HyperOS 状态栏上所有元素的颜色与透明度**（通知图标除外）。
 
-v12.0.2 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
+v12.0.3 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
 再选择对应的着色通道 —— 同一份 APK 在两类 ROM 上都能用。
 
-> v12.0.2：明暗场景切换时电量图标与其它元素**同步换色**（ColorOS 原本会跟着系统的颜色渐变
+> v12.0.3：明暗场景切换时电量图标与其它元素**同步换色**（ColorOS 原本会跟着系统的颜色渐变
 > 慢半拍；HyperOS 的电量也可能收不到 dark 回调而一直等扫描 —— 现在以时钟换色为信号立即重刷）
 > 慢半拍，现在以时钟换色为信号立刻切组），见「场景切换的同步」。
 >
@@ -20,7 +20,7 @@ v12.0.2 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判�
 | ROM | 机型 | 版本 |
 |---|---|---|
 | ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3；v11.5.2 闪电颜色组、v12.0 场景同步验证 |
-| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证；v12.0.2 场景同步验证（OS3.0.8.0.VLRCNXM） |
+| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证；v12.0.3 场景同步验证（OS3.0.8.0.VLRCNXM） |
 
 作用域固定为 `com.android.systemui`（两类 ROM 的 SystemUI 都是这个包名）。
 
@@ -54,7 +54,7 @@ v12.0.2 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判�
 判定结果写进日志，一眼就能确认模块走的是哪条通道：
 
 ```
-StatColor: === v12.0.2 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
+StatColor: === v12.0.3 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
 StatColor: hyperos: com.android.systemui.statusbar.views.MiuiBatteryMeterView hooks=2
 ```
 
@@ -248,7 +248,7 @@ HyperOS 极性每次变化都会打一行日志：
 StatColor: [bar] #ff000000 from onDarkChanged 深色图标（浅色背景）→ 用「浅色背景」组
 ```
 
-#### 场景切换的同步（v12.0 ~ v12.0.2）
+#### 场景切换的同步（v12.0 ~ v12.0.3）
 
 明暗切换时，状态栏文字 / 图标是**一帧内**换完的，但 ColorOS 的电量图标会跟着系统的
 颜色过渡**渐变**过去（实测 p1/p2/p3 在约 160ms 内从 `#4D000000/#E6000000` 一路变到
@@ -284,6 +284,17 @@ StatColor: [sync] clock #dde1e1e1 → 深色背景组
 系统的烘焙就会把旧色压回去 —— 下一帧再被我们改回来，看起来就是「闪一下」。
 现在直接在 `updateProgressBackgroundBitmap()` / 空心样式的 `updateFirstBitmap()`、
 `updateSecondBitmap()` **之前**再摆一次 tint：不管谁触发烘焙，烘进去的永远是当前场景的颜色。
+
+最后是**短瞬态**（v12.0.3）：用户录屏里逐帧看到，切 Settings 页时状态栏会整条变白约 60~80ms
+再变回来（`[sync] clock` 连续两次反向着色）。以前电量会立刻跟过去，看起来就是「闪一下」。
+现在时钟翻转只登记为**待确认**，120ms 后才真正应用到电量；这期间时钟又翻转就重排。
+真实的明暗切换不受影响 —— 电量自己的 `onDarkChanged` 通常 30ms 内就到，会先应用；
+只有它不来时才走这条 120ms 的兜底：
+
+```
+StatColor: [sync] clock #dde1e1e1 → 深色背景组
+StatColor: [sync] apply 深色背景组（时钟确认）
+```
 
 30fps 录屏逐帧对比（时钟 vs 电量的首次变色帧）：
 
@@ -435,7 +446,7 @@ FindRefs.java / findrefs.sh              扫描"谁引用了某个方法/字段"
 
 因此 minSdk 提到 **31**（`Theme.DeviceDefault.DayNight` 自 API 29 起才存在），targetSdk 34。
 
-v11.5 起，日志区首行会显示 `模块版本 12.0.2 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
+v11.5 起，日志区首行会显示 `模块版本 12.0.3 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
 保存后会把**两条配置路径**的写入结果与内容都打到日志里。
 
 ---
@@ -496,7 +507,7 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 
 | 标记 | 含义 |
 |---|---|
-| `=== v12.0.2 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
+| `=== v12.0.3 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
 | `hyperos: ... hooks=N` | HyperOS 电量相关钩子挂载数量（`MISS` 表示该类不存在，ROM 可能变了） |
 | `conf file = ...` / `conf source = ...` | 配置实际用的哪条路径（HyperOS 应为 `/data/system/statcolor.conf`） |
 | `[sweep] ...` / `[sweep-skip] ...` / `[sweep-text] ...` | 视图树扫描改色 / 因位置被跳过 / 文字改色 |
@@ -506,6 +517,7 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 | `[bar] #... from ...` | 状态栏明暗极性变化，决定电量用「深色背景」还是「浅色背景」那组颜色 |
 | `[sync] clock #...` | 场景翻转（时钟换色）—— 电量随即按新场景切组并冻结 300ms，避免跟着系统渐变动画 |
 | `[sync] refresh N views` | HyperOS：场景翻转时立即重刷的电量控件数量（不等系统的 dark 回调） |
+| `[sync] apply ...（时钟确认）` | 时钟翻转持续超过 120ms 后才应用到电量（短瞬态不跟随，避免闪一下） |
 | `[hyperos-hollow] ...` | 空心电量样式的处理 |
 | `[batt-draw] ... charging=true/false` | ColorOS 电量图标的充电判定结果 |
 | `[batt-bolt] bolt ...` | ColorOS 闪电上色 / 透明度 |

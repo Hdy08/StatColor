@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.0.2";
+    public static final String VERSION = "12.0.3";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -525,15 +525,42 @@ public final class Hook {
             sSceneAt = android.os.SystemClock.uptimeMillis();
             SYNC_HELD.clear();                       // 新场景：下一次绘制重新冻结
             if (Rom.isHyperOs()) {
-                // HyperOS 的电量要等它自己的 onDarkChanged 才换色，可能晚一两百毫秒
-                // （从设置返回桌面最明显）。先按新场景手动刷一遍，与文字同一帧生效。
-                sIconPolarity = p;
-                HyperOsHooks.refreshNow();
+                // 不立刻把电量刷过去：MIUI 切 Settings 页面时会短暂把时钟设成
+                // 相反的颜色（约 60~80ms 又改回来，见 [sync] clock 日志），
+                // 立刻跟随就会让电量白闪一下。推迟 CONFIRM_MS 再确认：
+                // 期间时钟又变了就重排，真切换则 120ms 内补上
+                // （正常情况电量自己的 onDarkChanged 会先到，根本轮不到这条兜底）。
+                sPendingP = p;
+                sSceneHandler.removeCallbacks(SCENE_APPLY);
+                sSceneHandler.postDelayed(SCENE_APPLY, SCENE_CONFIRM_MS);
             }
             log("[sync] clock #" + Integer.toHexString(systemColor)
                     + " → " + (p == 1 ? "深色背景" : "浅色背景") + "组");
         } catch (Throwable ignored) {}
     }
+
+    /** 时钟翻转后等待确认的时间：短于它的一闪而过不跟随。 */
+    private static final long SCENE_CONFIRM_MS = 120;
+
+    private static volatile int sPendingP = -1;
+
+    private static final android.os.Handler sSceneHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
+    /** 时钟翻转持续超过 SCENE_CONFIRM_MS 才真正应用到 HyperOS 电量。 */
+    private static final Runnable SCENE_APPLY = new Runnable() {
+        @Override public void run() {
+            try {
+                int p = sPendingP;
+                if (p < 0 || p != sSceneP) return;       // 已改回别的场景
+                if (p == sIconPolarity) return;          // 电量回调已经应用过
+                if (!Rom.isHyperOs()) return;
+                sIconPolarity = p;
+                HyperOsHooks.refreshNow();
+                log("[sync] apply " + (p == 1 ? "深色背景" : "浅色背景") + "组（时钟确认）");
+            } catch (Throwable ignored) {}
+        }
+    };
 
     /** 是否挂在锁屏窗口里（键屏的电量/时钟颜色语境和状态栏相反）。 */
     private static boolean inKeyguard(View v) {
