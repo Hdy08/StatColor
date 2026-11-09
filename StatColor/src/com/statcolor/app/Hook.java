@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "11.5.3";
+    public static final String VERSION = "11.5.4";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -1064,17 +1064,13 @@ public final class Hook {
             }
             BOLT_TINTED.remove(inst);
 
-            // ② chargePaint 的 ColorFilter + alpha（竖向 / 横向的 Bitmap 闪电）
+            // ② chargePaint 的 ColorFilter（竖向 / 横向的 Bitmap 闪电）
+            //    不动 Paint#setAlpha：那个 0x66 是 ColorOS 自己的半透明画法。
             Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
                 android.graphics.Paint p = (android.graphics.Paint) cp;
                 if (p.getColorFilter() != null) {
                     p.setColorFilter(null);
-                    touched = true;
-                }
-                Integer origA = PAINT_ALPHA_ORIG.remove(inst);
-                if (origA != null && p.getAlpha() != origA.intValue()) {
-                    p.setAlpha(origA.intValue());      // 还原系统原本的半透明画法
                     touched = true;
                 }
             }
@@ -1111,14 +1107,6 @@ public final class Hook {
 
     /** chargePaint 上已挂的 ColorFilter 颜色（竖向 / 横向的 Bitmap 闪电）。 */
     private static final java.util.Map<Object, Integer> PAINT_TINTED =
-            java.util.Collections.synchronizedMap(
-                    new java.util.WeakHashMap<Object, Integer>());
-
-    /**
-     * chargePaint 上色**之前**它自己的 alpha（系统默认值，实测约 0x66）。
-     * 下拉面板那边还原时要用它，不能一律写 255 —— 那会改变系统原本的画法。
-     */
-    private static final java.util.Map<Object, Integer> PAINT_ALPHA_ORIG =
             java.util.Collections.synchronizedMap(
                     new java.util.WeakHashMap<Object, Integer>());
 
@@ -1381,30 +1369,20 @@ public final class Hook {
             //    SRC_IN 的输出 alpha = Sa × Da，色相和透明度都由配置色决定。
             //    这一段与 chargingDrawable 无关：竖向电量**只有**这条路。
             //
-            //    坑：滤镜的 alpha 管不了 Paint 自己的 alpha ——
+            //    **不碰 Paint#setAlpha**（v11.5.4 定案）：ColorOS 给 chargePaint
+            //    预设了约 0x66 的 alpha，闪电本来就是半透明画法，这是系统设计。
             //    最终 alpha = 滤镜 alpha × paint alpha × 位图 alpha，
-            //    ColorOS 给 chargePaint 设了约 0x66 的 alpha（闪电本来就画成半透明），
-            //    只改滤镜的结果是「浅色场景设了 FF 仍然只有 40%」。
-            //    所以滤镜用**不透明**色，透明度单独写进 Paint#setAlpha。
+            //    所以配置的透明度会**再乘**这个 0.66 —— 看起来比配置更淡是正常的，
+            //    强行把 paint alpha 顶到 255 会改变系统原本的观感，已确认不要。
             Object cp = readFieldCached(inst, "chargePaint");
             if (cp instanceof android.graphics.Paint) {
-                android.graphics.Paint p = (android.graphics.Paint) cp;
                 Integer prevP = PAINT_TINTED.get(inst);
                 if (prevP == null || prevP.intValue() != want) {
-                    if (!PAINT_ALPHA_ORIG.containsKey(inst)) {
-                        PAINT_ALPHA_ORIG.put(inst, Integer.valueOf(p.getAlpha()));
-                    }
-                    int prevA = p.getAlpha();
-                    p.setAlpha(cfgA);
-                    p.setColorFilter(new android.graphics.PorterDuffColorFilter(
-                            (want & 0x00FFFFFF) | 0xFF000000,
-                            android.graphics.PorterDuff.Mode.SRC_IN));
+                    ((android.graphics.Paint) cp).setColorFilter(
+                            new android.graphics.PorterDuffColorFilter(
+                                    want, android.graphics.PorterDuff.Mode.SRC_IN));
                     PAINT_TINTED.put(inst, Integer.valueOf(want));
                     BOLT_CLEAN.remove(inst);
-                    if (BATT_BOLT_LOG.incrementAndGet() <= 8) {
-                        log("[batt-bolt] paint alpha " + prevA + " -> " + cfgA
-                                + " color=#" + Integer.toHexString((want & 0x00FFFFFF) | 0xFF000000));
-                    }
                 }
             }
         } catch (Throwable t) { logOnce("bolt err " + t); }

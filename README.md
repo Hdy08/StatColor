@@ -2,19 +2,21 @@
 
 一个 LSPosed 模块，用来**统一修改 ColorOS / OxygenOS 与 HyperOS 状态栏上所有元素的颜色与透明度**（通知图标除外）。
 
-v11.5.3 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
+v11.5.4 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
 再选择对应的着色通道 —— 同一份 APK 在两类 ROM 上都能用。
 
-> v11.5.3 修复：两类 ROM 的电量图标在「浅色状态栏」下都会误用「深色背景」那组配置色 ——
-> HyperOS 是未充电时的电池外框，ColorOS 是**充电时**的闪电；另外修掉 ColorOS 竖向/横向闪电
-> 始终带系统半透明（配置不透明度 FF 也不生效）的问题。详见下文「颜色组」「闪电有两条不同的实现」。
+> v11.5.4 修复：两类 ROM 的电量图标在「浅色状态栏」下都会误用「深色背景」那组配置色 ——
+> HyperOS 是未充电时的电池外框，ColorOS 是**充电时**的闪电。详见下文「颜色组」。
+>
+> 竖向/横向电量的闪电**故意保留** ColorOS 给 `chargePaint` 预设的 `0x66` 半透明画法
+> （配置透明度会在这个基础上再乘），见「闪电有两条不同的实现」。
 
 实测环境：
 
 | ROM | 机型 | 版本 |
 |---|---|---|
-| ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3；v11.5.2 验证充电闪电颜色组，v11.5.3 修透明度 |
-| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证（OS3.0.8.0.VLRCNXM）；v11.5.3 仅改 ColorOS 分支 |
+| ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3；v11.5.2 验证充电闪电颜色组 |
+| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证（OS3.0.8.0.VLRCNXM） |
 
 作用域固定为 `com.android.systemui`（两类 ROM 的 SystemUI 都是这个包名）。
 
@@ -48,7 +50,7 @@ v11.5.3 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判�
 判定结果写进日志，一眼就能确认模块走的是哪条通道：
 
 ```
-StatColor: === v11.5.3 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
+StatColor: === v11.5.4 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
 StatColor: hyperos: com.android.systemui.statusbar.views.MiuiBatteryMeterView hooks=2
 ```
 
@@ -172,11 +174,10 @@ p3 → mCircleChargingPaint + circleFramePaint(30%) + 闪电
 - 圆形：`chargingDrawable.setTintList(...)`，但 **tintMode 是 `SRC_ATOP`** —— 该模式输出 alpha 取目标 alpha，把透明度塞进 tint 颜色里在数学上无效，必须另外调 `Drawable#setAlpha`
 - 横向/竖向：闪电是 **Bitmap**（字段 `chargingBitmap`），用 `chargePaint` 画出，没有 tint 可设 —— 给 `chargePaint` 挂 `PorterDuffColorFilter(SRC_IN)`
 
-> 竖向/横向还有第二个坑（v11.5.3）：`PorterDuffColorFilter` 的 alpha 管不了 `Paint` 自己的
-> alpha。最终 alpha = 滤镜 alpha × **paint alpha** × 位图 alpha，而 ColorOS 给 `chargePaint`
-> 设了约 `0x66` 的 alpha（闪电本来就画成半透明）。只改滤镜时，即使配置是 `FF`，
-> 闪电最高也只有 40%。正确做法：滤镜用**不透明**色，透明度用 `Paint#setAlpha(cfgA)`；
-> 下拉面板那边还原时写回上色前记下的原始 alpha（不能一律 255）。
+> 竖向/横向的 `chargePaint` **不要动 `Paint#setAlpha`**（v11.5.4 定案）：ColorOS 给它预设了
+> 约 `0x66` 的 alpha，闪电本来就是半透明画法。最终 alpha = 滤镜 alpha × paint alpha × 位图 alpha，
+> 所以配置的不透明度会在这个 0.66 的基础上再乘 —— 看起来比配置更淡是系统设计，不是没生效。
+> 把 paint alpha 顶到 255 会改变原本观感，已确认不要。
 
 #### HyperOS：自绘控件 + Drawable tint
 
@@ -211,7 +212,7 @@ MiuiBatteryMeterView (LinearLayout)
 `firstBackground` / `secondBackground` / `thirdBackground` 的 tint 与 `textPaint` 颜色，
 再调 `updateFirstBitmap()` / `updateSecondBitmap()` 重建。
 
-#### 颜色组：跟随状态栏明暗（v11.5.2 / v11.5.3 修复）
+#### 颜色组：跟随状态栏明暗（v11.5.2 修复）
 
 配置里有两组颜色：`color_dark`（深色背景 → 浅色图标）与 `color_light`（浅色背景 → 深色图标）。
 选哪一组由 `recolor()` 按**输入色的亮度**决定 —— 文字、WiFi、信号拿到的都是系统下发的
@@ -234,7 +235,7 @@ HyperOS 的极性记在 `Hook.sIconPolarity`（`barSeedShared()` 返回白/黑�
   表现就是电池在两组颜色之间闪（v11.5.1 调试实测）。
 - **ColorOS 不能记全局极性**：状态栏、锁屏、充电动画是**三支不同的电量 drawable**，
   颜色整好相反；按「最后画的那支」记全局，闪电会 1~2 秒在两组颜色之间翻一次
-  （v11.5.3 实测，表现就是浅色状态栏上闪电时黑时半透明白）。现在种子只取当前这支
+  （v11.5.2 实测，表现就是浅色状态栏上闪电时黑时半透明白）。现在种子只取当前这支
   drawable 自己的颜色，天然跟着它所在的窗口走。
 
 HyperOS 极性每次变化都会打一行日志：
@@ -384,7 +385,7 @@ FindRefs.java / findrefs.sh              扫描"谁引用了某个方法/字段"
 
 因此 minSdk 提到 **31**（`Theme.DeviceDefault.DayNight` 自 API 29 起才存在），targetSdk 34。
 
-v11.5 起，日志区首行会显示 `模块版本 11.5.3 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
+v11.5 起，日志区首行会显示 `模块版本 11.5.4 · 当前系统 HyperOS(OS3.0.8.0.VLRCNXM)`，
 保存后会把**两条配置路径**的写入结果与内容都打到日志里。
 
 ---
@@ -445,7 +446,7 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 
 | 标记 | 含义 |
 |---|---|
-| `=== v11.5.3 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
+| `=== v11.5.4 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
 | `hyperos: ... hooks=N` | HyperOS 电量相关钩子挂载数量（`MISS` 表示该类不存在，ROM 可能变了） |
 | `conf file = ...` / `conf source = ...` | 配置实际用的哪条路径（HyperOS 应为 `/data/system/statcolor.conf`） |
 | `[sweep] ...` / `[sweep-skip] ...` / `[sweep-text] ...` | 视图树扫描改色 / 因位置被跳过 / 文字改色 |
@@ -455,7 +456,7 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 | `[bar] #... from ...` | 状态栏明暗极性变化，决定电量用「深色背景」还是「浅色背景」那组颜色 |
 | `[hyperos-hollow] ...` | 空心电量样式的处理 |
 | `[batt-draw] ... charging=true/false` | ColorOS 电量图标的充电判定结果 |
-| `[batt-bolt] bolt ...` / `paint alpha ...` | ColorOS 闪电上色 / 透明度（`paint alpha` 是竖向/横向那支 `chargePaint` 的改写） |
+| `[batt-bolt] bolt ...` | ColorOS 闪电上色 / 透明度 |
 | `tint err ...` | 某个钩子抛异常（早期 WiFi 全白就是这里的 `NoSuchMethodException`） |
 
 保存配置后，界面日志会输出两条路径的写入结果与实际内容，可直接核对。
