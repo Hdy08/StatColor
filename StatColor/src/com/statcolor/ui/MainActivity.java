@@ -24,6 +24,7 @@ import android.widget.Toast;
 import com.statcolor.R;
 import com.statcolor.app.Config;
 import com.statcolor.app.Hook;
+import com.statcolor.app.Rom;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -145,7 +146,9 @@ public class MainActivity extends Activity {
             @Override public void onClick(View v) { showDiag(); }
         });
 
-        tvLog.setText("模块版本 " + Hook.VERSION + "\n作用域：com.android.systemui\n"
+        tvLog.setText("模块版本 " + Hook.VERSION + "\n"
+                + "当前系统：" + Rom.describe() + "\n"
+                + "作用域：com.android.systemui\n"
                 + "配置项：启用 / 两组颜色 / 透明度 / 明暗模式\n"
                 + "保存后需重启 SystemUI 生效。");
     }
@@ -642,16 +645,33 @@ public class MainActivity extends Activity {
         restartSystemUi();
     }
 
+    /** 配置镜像同步结果。 */
+    private static final class SyncResult {
+        final boolean ok;
+        final String msg;
+
+        SyncResult(boolean ok, String msg) {
+            this.ok = ok;
+            this.msg = msg;
+        }
+    }
+
     /**
-     * 把当前配置写成 "key=value" 文本，镜像到 /data/local/tmp/statcolor.conf（0644）。
+     * 把当前配置写成 "key=value" 文本，镜像到全局可读位置。
      *
-     * 这是 Hook 侧最可靠的配置来源：不依赖 XSharedPreferences 的可见性，
-     * 也不受 getSharedPreferences 在 CE/DE 存储间分叉的影响。
-     * 需要 root；失败不致命，Hook 会退回另外两条路。
+     * 两个位置都会写：
+     *   /data/local/tmp/statcolor.conf   ← ColorOS / OxygenOS 的 SystemUI 能读
+     *   /data/system/statcolor.conf      ← HyperOS 的 SystemUI 只认这条
      *
-     * @return null 表示成功，否则返回错误说明
+     * 为什么 HyperOS 必须换位置：它的 SystemUI 跑在 system_app 域，而
+     * /data/local/tmp 属于 shell_data_file，system_app 连目录 search 都被
+     * SELinux 拒绝（dmesg 里能看到 avc denied）。/data/system 是
+     * system_data_file，system_app 可读。
+     *
+     * 需要 root；只要有一条写成功就算成功，Hook 侧会自己挑能读的那条。
      */
-    private String syncConfFile() {
+    private SyncResult syncConfFile() {
+        File tmp = new File(getFilesDir(), "statcolor.conf");
         try {
             StringBuilder sb = new StringBuilder();
             sb.append(Config.KEY_ENABLE).append('=').append(swEnable.isChecked()).append('\n');
@@ -667,41 +687,56 @@ public class MainActivity extends Activity {
                             : Config.MODE_AUTO).append('\n');
 
             // 先写应用私有目录（必定可写）
-            File tmp = new File(getFilesDir(), "statcolor.conf");
             FileOutputStream fos = new FileOutputStream(tmp);
             try {
                 fos.write(sb.toString().getBytes("UTF-8"));
             } finally {
                 fos.close();
             }
-
-            // 再用 root 拷到全局可读位置
-            String out = exec("su", "-c",
-                    "cp " + tmp.getAbsolutePath() + " " + Hook.CONF_FILE
-                            + " && chmod 644 " + Hook.CONF_FILE);
-            String verify = exec("su", "-c", "ls -l " + Hook.CONF_FILE);
-            if (verify == null || !verify.contains("statcolor.conf")) {
-                return "su 写入失败，输出=" + out;
-            }
-            return null;
         } catch (Throwable t) {
-            return "异常：" + t;
+            return new SyncResult(false, "写临时文件失败：" + t);
         }
+
+        StringBuilder okPaths = new StringBuilder();
+        StringBuilder err = new StringBuilder();
+        for (String path : Hook.CONF_PATHS) {
+            String out = exec("su", "-c",
+                    "cp " + tmp.getAbsolutePath() + " " + path
+                            + " && chmod 644 " + path);
+            String verify = exec("su", "-c", "ls -l " + path);
+            if (verify == null || verify.startsWith("__ERR__") || verify.indexOf(path) < 0) {
+                if (err.length() > 0) err.append('\n');
+                err.append("✗ ").append(path);
+                String o = out == null ? "" : out.trim();
+                if (o.length() > 0) {
+                    if (o.length() > 120) o = o.substring(0, 120) + "…";
+                    err.append("（").append(o).append("）");
+                }
+            } else {
+                if (okPaths.length() > 0) okPaths.append('\n');
+                okPaths.append(path);
+            }
+        }
+        if (okPaths.length() == 0) {
+            return new SyncResult(false, err.length() == 0 ? "su 写入失败" : err.toString());
+        }
+        return new SyncResult(true, okPaths.toString());
     }
 
     /** 重启 SystemUI 让配置生效。先同步配置文件，再 kill。 */
     private void restartSystemUi() {
         new Thread(new Runnable() {
             @Override public void run() {
-                final String syncErr = syncConfFile();
+                final SyncResult sync = syncConfFile();
                 String out = exec("su", "-c", "killall com.android.systemui");
                 final String r = out;
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override public void run() {
-                        if (syncErr != null) {
-                            appendLog("配置镜像同步失败 —— " + syncErr);
+                        if (!sync.ok) {
+                            appendLog("配置镜像同步失败：\n" + sync.msg);
+                            appendLog("（会退回 SharedPreferences 读取，建议检查 root 授权）");
                         } else {
-                            appendLog("配置已同步到 " + Hook.CONF_FILE);
+                            appendLog("配置已同步到：\n" + sync.msg);
                         }
                         if (r == null || r.startsWith("__ERR__")) {
                             appendLog("自动重启失败，请手动重启手机。");
@@ -719,15 +754,22 @@ public class MainActivity extends Activity {
     /** 读回配置文件内容，用于自诊断。 */
     private void showDiag() {
         appendLog("──── 自诊断 ────");
-        appendLog("模块版本 " + Hook.VERSION + " · 配置文件 " + Hook.CONF_FILE);
+        appendLog("模块版本 " + Hook.VERSION + " · 当前系统 " + Rom.describe());
 
-        String r = exec("su", "-c", "ls -l " + Hook.CONF_FILE);
-        if (r == null || r.startsWith("__ERR__") || r.indexOf("statcolor.conf") < 0) {
-            appendLog("✗ 配置文件不存在（Hook 将退回 SharedPreferences）");
-        } else {
+        boolean any = false;
+        for (String path : Hook.CONF_PATHS) {
+            String r = exec("su", "-c", "ls -l " + path);
+            if (r == null || r.startsWith("__ERR__") || r.indexOf(path) < 0) {
+                appendLog("✗ " + path + "（不存在）");
+                continue;
+            }
+            any = true;
             appendLog("✓ " + r.trim());
-            String body = exec("su", "-c", "cat " + Hook.CONF_FILE);
+            String body = exec("su", "-c", "cat " + path);
             appendLog("内容：\n" + (body == null ? "(读不到)" : body.trim()));
+        }
+        if (!any) {
+            appendLog("两个位置都没有配置文件（Hook 将退回 SharedPreferences）");
         }
 
         SharedPreferences sp = Config.prefs(this);
