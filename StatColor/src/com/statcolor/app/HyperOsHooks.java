@@ -28,8 +28,8 @@ import de.robv.android.xposed.XposedBridge;
  *     ├─ onDarkChangeInternal()  ← 颜色唯一的计算点
  *     │    mTintBgDrawable.setTintList(白/黑)                 // 外框
  *     │    mProgressClipDrawable.setTintList(状态色或白/黑)   // 电量填充
- *     │    updateProgressBackgroundBitmap()                  // 把上面两者烘焙成位图
- *     └─ onDraw(Canvas)          ← 只画烘焙好的位图
+ *     │    updateProgressBackgroundBitmap()                  // 缓存填充与裁剪结果
+ *     └─ onDraw(Canvas)          ← 先画填充位图，再直接画外框 / 闪电
  *   以及容器
  *   com.android.systemui.statusbar.views.MiuiBatteryMeterView
  *     ├─ onDarkChanged(ArrayList, float, int, int, int, boolean)  ← 颜色入口
@@ -65,6 +65,7 @@ final class HyperOsHooks {
     // ───────────────────────────────────────────────────────────── 挂载
 
     static void install(ClassLoader cl) {
+        HyperOsTint.install(cl);
         hookBatteryContainer(cl);
         hookBatteryIcon(cl);
         hookHollowIcon(cl);
@@ -82,7 +83,7 @@ final class HyperOsHooks {
             int pc = m.getParameterTypes().length;
             if ("onDarkChanged".equals(nm) && pc == 6) {
                 hookAfter(m, new XC_MethodHook() {
-                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
                         try {
                             Object self = p.thisObject;
                             // 只认状态栏那一个实例：锁屏 / AOD 用的是同名控件的
@@ -93,10 +94,13 @@ final class HyperOsHooks {
                                 Hook.noteBarTint(((Integer) p.args[2]).intValue(),
                                         "onDarkChanged");
                             }
-                            applyContainer(self);
                         } catch (Throwable t) {
                             Hook.logOnceShared("hyperos onDarkChanged err " + t);
                         }
+                    }
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        try { applyContainer(p.thisObject); }
+                        catch (Throwable t) { Hook.logOnceShared("hyperos container err " + t); }
                     }
                 });
                 hooked++;
@@ -134,9 +138,29 @@ final class HyperOsHooks {
                             Object self = p.thisObject;
                             if (self instanceof View
                                     && Hook.inStatusBarWindowShared((View) self)) {
-                                paintIconTints(self);
+                                IconBake pending = paintIconTints(self);
+                                if (pending != null) BAKING_ICONS.put(self, pending);
+                                else BAKING_ICONS.remove(self);
                             }
                         } catch (Throwable ignored) {}
+                    }
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            if (!p.hasThrowable()) rememberBakedIcon(p.thisObject);
+                            else BAKING_ICONS.remove(p.thisObject);
+                        } catch (Throwable t) { Hook.logOnceShared("hyperos bake record err " + t); }
+                    }
+                });
+                hooked++;
+            } else if ("onDraw".equals(m.getName()) && m.getParameterTypes().length == 1) {
+                hookBefore(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            if (!getBool(p.thisObject, "mUseLegacyDrawable")) {
+                                applyIcon(p.thisObject, true);
+                            }
+                        }
+                        catch (Throwable t) { Hook.logOnceShared("hyperos icon draw err " + t); }
                     }
                 });
                 hooked++;
@@ -207,62 +231,12 @@ final class HyperOsHooks {
     static void onSweep(View v) {
         if (v == null) return;
         String cn = v.getClass().getName();
-        rememberView(v);
         if (CLS_BATTERY_VIEW.equals(cn)) {
             applyContainerInner(v);
         } else if (CLS_BATTERY_ICON.equals(cn)) {
             applyIcon(v, false);
         } else if (CLS_HOLLOW_ICON.equals(cn)) {
             applyHollow(v, false);
-        }
-    }
-
-    /** 见过的电量控件（弱引用），场景翻转时可以立刻重刷，不等系统的 dark 回调。 */
-    private static final java.util.Map<View, Boolean> KNOWN =
-            java.util.Collections.synchronizedMap(
-                    new java.util.WeakHashMap<View, Boolean>());
-
-    private static final AtomicInteger REFRESH_LOG = new AtomicInteger();
-
-    private static void rememberView(View v) {
-        if (v == null) return;
-        String cn = v.getClass().getName();
-        if (CLS_BATTERY_VIEW.equals(cn) || CLS_BATTERY_ICON.equals(cn)
-                || CLS_HOLLOW_ICON.equals(cn)) {
-            KNOWN.put(v, Boolean.TRUE);
-        }
-    }
-
-    /**
-     * 场景翻转（时钟先变色）时立刻按新场景重刷电量。
-     *
-     * 为什么需要：从设置返回桌面这类切换，状态栏文字/图标是立即换色的，
-     * 但 MIUI 的电量控件要等它自己的 onDarkChanged 回调 —— 可能晚一两百毫秒，
-     * 期间电量还停在旧场景的颜色上，看起来就是「电量慢半拍」。
-     * 这里直接拿已知控件重刷一遍，和文字同一帧生效。
-     */
-    static void refreshNow() {
-        java.util.List<View> list;
-        synchronized (KNOWN) {
-            list = new java.util.ArrayList<View>(KNOWN.keySet());
-        }
-        if (REFRESH_LOG.incrementAndGet() <= 8) {
-            Hook.logShared("[sync] refresh " + list.size()
-                    + " views p=#" + Integer.toHexString(Hook.barSeedShared()));
-        }
-        for (View v : list) {
-            try {
-                if (!Hook.inStatusBarWindowShared(v)) continue;
-                String cn = v.getClass().getName();
-                if (CLS_BATTERY_VIEW.equals(cn)) {
-                    applyContainerInner(v);
-                } else if (CLS_BATTERY_ICON.equals(cn)) {
-                    applyIcon(v, false);
-                } else if (CLS_HOLLOW_ICON.equals(cn)) {
-                    applyHollow(v, false);
-                }
-                v.invalidate();                   // 确保这一帧就重画（状态栏可能正在动画）
-            } catch (Throwable ignored) {}
         }
     }
 
@@ -276,8 +250,7 @@ final class HyperOsHooks {
     }
 
     private static void applyContainerInner(View v) {
-        rememberView(v);
-        Integer t = target();
+        Integer t = target(v);
         if (t == null) return;
         int target = t.intValue();
 
@@ -307,8 +280,7 @@ final class HyperOsHooks {
                 && Hook.inStatusBarWindowShared((View) icon))) {
             return false;
         }
-        if (icon instanceof View) rememberView((View) icon);
-        Integer t = target();
+        Integer t = target(icon);
         if (t == null) return false;
         int target = t.intValue();
 
@@ -318,62 +290,70 @@ final class HyperOsHooks {
         boolean perf = getBool(icon, "mPerformanceMode");
         int progColor = iconProgColor(icon, target);
 
-        boolean changed = false;
         Drawable bg = getDrawable(icon, "mTintBgDrawable");
-        if (bg != null) changed |= setTint(bg, target);
         Drawable prog = getDrawable(icon, "mProgressClipDrawable");
+        // 某些 ROM 的 Drawable 没有可读的 getTintList()。先检查已完成的烘焙，
+        // 避免把「读不到 tint」当成每帧都要改色，形成 invalidate / onDraw 循环。
+        if (isIconBaked(icon, target, progColor, bg, prog)) return false;
+        boolean changed = false;
+        if (bg != null) changed |= setTint(bg, target);
         if (prog != null) changed |= setTint(prog, progColor);
 
-        if (changed) {
+        // 外框直接绘制，填充却读取缓存位图。Drawable 已是新 tint 并不代表位图
+        // 也已更新；绘制前同时核对最后一次实际烘焙的颜色，避免只有边框先变。
+        if (changed || (!getBool(icon, "mUseLegacyDrawable")
+                && bg != null && prog != null)) {
             // 颜色在 updateProgressBackgroundBitmap() 里被烘焙进位图，
             // 改完 tint 必须重建，否则要等下一次布局 / 电量变化才生效。
-            //
-            // 场景切换的那 300ms 内不立刻烘焙：手势返回桌面 / 打开设置时，
-            // 系统会连着下发好几次相反的颜色（短暂态），立刻烘焙就等于把
-            // 中间那一两帧的「白」画出来 —— 模块开着比关掉更闪、更慢就是这个
-            // 原因。这里合并成一次：80ms 后颜色稳定了再烘焙。
-            if (Hook.inSceneTransitionShared()) {
-                scheduleBake(icon);
-            } else {
-                invoke(icon, "updateProgressBackgroundBitmap");
-                if (icon instanceof View) ((View) icon).invalidate();
-            }
+            invoke(icon, "updateProgressBackgroundBitmap");
+            if (icon instanceof View) ((View) icon).invalidate();
             if (BATT_LOG.incrementAndGet() <= 12) {
                 Hook.logShared("[hyperos-batt] " + state(charging, low, save, perf)
-                        + " seed=#" + hex(Hook.barSeedShared())
                         + " bg=#" + hex(target) + " prog=#" + hex(progColor));
             }
         }
         return changed;
     }
 
-    // ── 场景切换期间的合并烘焙 ───────────────────────────────────────────
+    private static final java.util.Map<Object, IconBake> BAKED_ICONS =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, IconBake>());
+    private static final java.util.Map<Object, IconBake> BAKING_ICONS =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, IconBake>());
 
-    private static final long BAKE_DELAY_MS = 80;
+    private static boolean isIconBaked(Object icon, int background, int progress,
+                                       Drawable bg, Drawable prog) {
+        IconBake baked = BAKED_ICONS.get(icon);
+        if (!(icon instanceof View) || baked == null) return false;
+        View v = (View) icon;
+        return baked.background == background && baked.progress == progress
+                && baked.width == v.getWidth() && baked.height == v.getHeight()
+                && baked.bg.get() == bg && baked.prog.get() == prog;
+    }
 
-    private static final android.os.Handler sBakeHandler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
+    private static void rememberBakedIcon(Object icon) {
+        IconBake pending = BAKING_ICONS.remove(icon);
+        if (pending == null) return;
+        if (!(icon instanceof View) || !Hook.inStatusBarWindowShared((View) icon)) return;
+        View v = (View) icon;
+        Object bitmap = get(icon, "mProgressBackgroundBitmap");
+        if (!(bitmap instanceof android.graphics.Bitmap)) return;
+        android.graphics.Bitmap b = (android.graphics.Bitmap) bitmap;
+        if (b.isRecycled() || b.getWidth() != v.getWidth() || b.getHeight() != v.getHeight()) return;
+        BAKED_ICONS.put(icon, pending);
+    }
 
-    private static final java.util.Map<Object, Runnable> PENDING_BAKE =
-            java.util.Collections.synchronizedMap(
-                    new java.util.WeakHashMap<Object, Runnable>());
+    private static final class IconBake {
+        final int background, progress, width, height;
+        final java.lang.ref.WeakReference<Drawable> bg, prog;
 
-    /** 80ms 后再烘焙（每次都替换上一次，等于合并成一次）。 */
-    private static void scheduleBake(final Object icon) {
-        Runnable old = PENDING_BAKE.remove(icon);
-        if (old != null) sBakeHandler.removeCallbacks(old);
-        Runnable r = new Runnable() {
-            @Override public void run() {
-                try {
-                    PENDING_BAKE.remove(icon);
-                    paintIconTints(icon);                 // 用最新场景的颜色
-                    invoke(icon, "updateProgressBackgroundBitmap");
-                    if (icon instanceof View) ((View) icon).invalidate();
-                } catch (Throwable ignored) {}
-            }
-        };
-        PENDING_BAKE.put(icon, r);
-        sBakeHandler.postDelayed(r, BAKE_DELAY_MS);
+        IconBake(View view, int background, int progress, Drawable bg, Drawable prog) {
+            this.background = background;
+            this.progress = progress;
+            this.width = view.getWidth();
+            this.height = view.getHeight();
+            this.bg = new java.lang.ref.WeakReference<Drawable>(bg);
+            this.prog = new java.lang.ref.WeakReference<Drawable>(prog);
+        }
     }
 
     /**
@@ -404,12 +384,18 @@ final class HyperOsHooks {
      * （MIUI 的 dark 回调、我们自己的刷新、布局变化），烘焙进位图的都是这一套颜色，
      * 不会再出现「系统拿旧色烘焙 → 下一帧才被我们改回来」的偶发闪一下。
      */
-    private static void paintIconTints(Object icon) {
-        Integer t = target();
-        if (t == null) return;
+    private static IconBake paintIconTints(Object icon) {
+        Integer t = target(icon);
+        if (t == null) return null;
         int target = t.intValue();
-        setTint(getDrawable(icon, "mTintBgDrawable"), target);
-        setTint(getDrawable(icon, "mProgressClipDrawable"), iconProgColor(icon, target));
+        Drawable bg = getDrawable(icon, "mTintBgDrawable");
+        Drawable prog = getDrawable(icon, "mProgressClipDrawable");
+        int progress = iconProgColor(icon, target);
+        // 这里必须写入：系统可能刚用同一实例下发过原色，不能相信上次读回的 tint。
+        if (bg != null) bg.setTintList(ColorStateList.valueOf(target));
+        if (prog != null) prog.setTintList(ColorStateList.valueOf(progress));
+        return icon instanceof View && bg != null && prog != null
+                ? new IconBake((View) icon, target, progress, bg, prog) : null;
     }
 
     /** 空心样式第二层的颜色（充电/低电量等系统状态色只缩 alpha）。 */
@@ -432,7 +418,7 @@ final class HyperOsHooks {
 
     /** 只摆正空心样式的 tint（重建位图前调用）。 */
     private static void paintHollowTints(Object h) {
-        Integer t = target();
+        Integer t = target(h);
         if (t == null) return;
         int target = t.intValue();
         setTint(getDrawable(h, "firstBackground"), target);
@@ -446,8 +432,7 @@ final class HyperOsHooks {
                 && Hook.inStatusBarWindowShared((View) h))) {
             return false;
         }
-        if (h instanceof View) rememberView((View) h);
-        Integer t = target();
+        Integer t = target(h);
         if (t == null) return false;
         int target = t.intValue();
         boolean charging = getBool(h, "charging") || getBool(h, "quickCharging");
@@ -492,8 +477,10 @@ final class HyperOsHooks {
         return "charging=" + charging + " low=" + low + " save=" + save + " perf=" + perf;
     }
 
-    /** 配置色（种子取自状态栏当前明暗，交给 Hook 的选组 / 透明度规则换算）。 */
-    private static Integer target() {
+    /** 优先使用当前视图所在区域的分发快照；接口缺失时回退到系统电量回调的种子。 */
+    private static Integer target(Object view) {
+        Integer t = view instanceof View ? HyperOsTint.target((View) view) : null;
+        if (t != null) return t;
         return Hook.recolorShared(Hook.barSeedShared());
     }
 
@@ -511,7 +498,9 @@ final class HyperOsHooks {
         try {
             ColorStateList cur = iv.getImageTintList();
             if (cur != null && cur.getDefaultColor() == color) return;
-            iv.setImageTintList(ColorStateList.valueOf(color));
+            Hook.beginSelfApply();
+            try { iv.setImageTintList(ColorStateList.valueOf(color)); }
+            finally { Hook.endSelfApply(); }
         } catch (Throwable ignored) {}
     }
 
@@ -624,7 +613,7 @@ final class HyperOsHooks {
         return f;
     }
 
-    private static Object get(Object inst, String name) {
+    static Object get(Object inst, String name) {
         try {
             Field f = field(inst, name);
             return f == null ? null : f.get(inst);

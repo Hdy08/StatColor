@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.0.4";
+    public static final String VERSION = "12.1.1";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -127,7 +127,8 @@ public final class Hook {
 
             // ── 通用通道：按状态栏窗口划界，与 ROM 无关 ──
             hookStatusBarDrawScope(cl);
-            hookPaint(cl);
+            // HyperOS 在 View 与电量位图入口统一处理；绘制期再按亮度改色会破坏渐变。
+            if (rom != Rom.HYPEROS) hookPaint(cl);
             hookImageTint(cl);
             hookTextColor(cl);
 
@@ -171,6 +172,7 @@ public final class Hook {
                         IN_STATUS_BAR.set(isSb);
                         if (isSb) {
                             captureContext(root);   // 兜底：不依赖 StatusBarIconView
+                            SB_ROOTS.add(root);
                             scheduleTreeDump(root);
                             maybeSweep(root);
                         }
@@ -208,6 +210,22 @@ public final class Hook {
     private static long sLastSweepAt;
     private static final AtomicInteger SWEEP_HITS = new AtomicInteger();
     private static final AtomicInteger SWEEP_SKIP = new AtomicInteger();
+
+    private static final java.util.Set<View> SB_ROOTS =
+            java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(
+                    new java.util.WeakHashMap<View, Boolean>()));
+
+    /** 系统颜色分发结束时补齐同一屏幕的所有受控元素，不受 80ms 扫描节流影响。 */
+    static void refreshStatusBarShared(int displayId) {
+        java.util.List<View> roots;
+        synchronized (SB_ROOTS) { roots = new java.util.ArrayList<View>(SB_ROOTS); }
+        for (View root : roots) {
+            if (!root.isAttachedToWindow() || root.getDisplay() == null
+                    || root.getDisplay().getDisplayId() != displayId) continue;
+            captureContext(root);
+            sweep(root, 0);
+        }
+    }
 
     private static void maybeSweep(View root) {
         long now = android.os.SystemClock.uptimeMillis();
@@ -371,8 +389,7 @@ public final class Hook {
             SB_TEXT_VIEWS.add(tv);          // 供 setTextColor 钩子做当次拦截
             if (tv.getVisibility() != View.VISIBLE) return;
             int cur = tv.getCurrentTextColor();
-            if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
-            Integer r = recolor(cur);
+            Integer r = recolorView(tv, cur);
             if (r == null) return;
             int out = r.intValue();
             if (out == cur) return;
@@ -420,8 +437,7 @@ public final class Hook {
                         if (!(a instanceof Integer)) return;
                         int cur = (Integer) a;
                         noteClockScene(tv, cur);
-                        if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
-                        Integer r = recolor(cur);
+                        Integer r = recolorView(tv, cur);
                         if (r == null || r.intValue() == cur) return;
                         // 诊断：系统想把「已经是我们颜色的文字」打回中性色 ——
                         // 这就是 v10.3 上功耗指示器 1Hz 闪烁的来源，现在被当次拦下。
@@ -466,8 +482,7 @@ public final class Hook {
                         int cur = (Integer) o.getClass()
                                 .getMethod("getDefaultColor").invoke(o);
                         noteClockScene(tv, cur);
-                        if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
-                        Integer r = recolor(cur);
+                        Integer r = recolorView(tv, cur);
                         if (r == null || r.intValue() == cur) return;
                         param.args[0] = newCsl(o, r.intValue());
                     } catch (Throwable ignored) {}
@@ -481,6 +496,7 @@ public final class Hook {
 
     /** 这个 TextView 是不是状态栏里的文字。 */
     private static boolean isStatusBarText(android.widget.TextView tv) {
+        if (Rom.isHyperOs() && !isInStatusBarWindow(tv)) return false;
         if (SB_TEXT_VIEWS.contains(tv)) return true;
         if (!isInStatusBarWindow(tv)) return false;
         SB_TEXT_VIEWS.add(tv);
@@ -513,6 +529,8 @@ public final class Hook {
      */
     static void noteClockScene(android.widget.TextView tv, int systemColor) {
         try {
+            // HyperOS 直接使用 DarkIconDispatcher 的当次快照；时钟不再另建一条时间线。
+            if (Rom.isHyperOs()) return;
             if (tv == null) return;
             if (!tv.getClass().getSimpleName().contains("Clock")) return;
             if (inKeyguard(tv)) return;               // 锁屏时钟不算（颜色语境可能相反）
@@ -524,43 +542,10 @@ public final class Hook {
             sSceneP = p;
             sSceneAt = android.os.SystemClock.uptimeMillis();
             SYNC_HELD.clear();                       // 新场景：下一次绘制重新冻结
-            if (Rom.isHyperOs()) {
-                // 不立刻把电量刷过去：MIUI 切 Settings 页面时会短暂把时钟设成
-                // 相反的颜色（约 60~80ms 又改回来，见 [sync] clock 日志），
-                // 立刻跟随就会让电量白闪一下。推迟 CONFIRM_MS 再确认：
-                // 期间时钟又变了就重排，真切换则 120ms 内补上
-                // （正常情况电量自己的 onDarkChanged 会先到，根本轮不到这条兜底）。
-                sPendingP = p;
-                sSceneHandler.removeCallbacks(SCENE_APPLY);
-                sSceneHandler.postDelayed(SCENE_APPLY, SCENE_CONFIRM_MS);
-            }
             log("[sync] clock #" + Integer.toHexString(systemColor)
                     + " → " + (p == 1 ? "深色背景" : "浅色背景") + "组");
         } catch (Throwable ignored) {}
     }
-
-    /** 时钟翻转后等待确认的时间：短于它的一闪而过不跟随。 */
-    private static final long SCENE_CONFIRM_MS = 120;
-
-    private static volatile int sPendingP = -1;
-
-    private static final android.os.Handler sSceneHandler =
-            new android.os.Handler(android.os.Looper.getMainLooper());
-
-    /** 时钟翻转持续超过 SCENE_CONFIRM_MS 才真正应用到 HyperOS 电量。 */
-    private static final Runnable SCENE_APPLY = new Runnable() {
-        @Override public void run() {
-            try {
-                int p = sPendingP;
-                if (p < 0 || p != sSceneP) return;       // 已改回别的场景
-                if (p == sIconPolarity) return;          // 电量回调已经应用过
-                if (!Rom.isHyperOs()) return;
-                sIconPolarity = p;
-                HyperOsHooks.refreshNow();
-                log("[sync] apply " + (p == 1 ? "深色背景" : "浅色背景") + "组（时钟确认）");
-            } catch (Throwable ignored) {}
-        }
-    };
 
     /** 是否挂在锁屏窗口里（键屏的电量/时钟颜色语境和状态栏相反）。 */
     private static boolean inKeyguard(View v) {
@@ -630,17 +615,18 @@ public final class Hook {
             // ColorOS 走 v11.4 的统一规则 tintArg()（状态色只缩 alpha）。
             Integer r;
             if (hyper) {
-                if (!isNeutralColor(cur) && !isConfiguredColor(cur)) return;
-                r = recolor(cur);
+                r = HyperOsTint.recolor(iv, cur);
                 if (r != null) sSbAlpha = (r.intValue() >>> 24) & 0xFF;
             } else {
                 r = tintArg(cur);
             }
             if (r == null) return;
             int out = r.intValue();
-            if (out == cur) return;
-            iv.setImageTintList(android.content.res.ColorStateList.valueOf(out));
             SB_ICON_VIEWS.add(iv);
+            if (out == cur) return;
+            SELF_APPLY.set(Boolean.TRUE);
+            try { iv.setImageTintList(android.content.res.ColorStateList.valueOf(out)); }
+            finally { SELF_APPLY.remove(); }
             if (SWEEP_HITS.incrementAndGet() <= 25) {
                 log("[sweep] " + iv.getClass().getSimpleName()
                         + " x=" + iv.getLeft() + " w=" + w
@@ -2131,6 +2117,7 @@ public final class Hook {
                         Object self = param.thisObject;
                         if (!(self instanceof View)) return;
                         View v = (View) self;
+                        if (SELF_APPLY.get() != null) return;
 
                         // 通知图标走的是同一个 setImageTintList
                         // （StatusBarIconView#onDarkChanged），调用链里没有
@@ -2141,6 +2128,7 @@ public final class Hook {
                         // 布局变化 / 系统主题变化时框架会重新下发白色 tint，
                         // 在这里当帧改掉，避免「颜色暂时失效」的闪烁。
                         if (SB_ICON_VIEWS.contains(v)) {
+                            if (Rom.isHyperOs() && !isInStatusBarWindow(v)) return;
                             Object o0 = param.args[0];
                             if (o0 == null) return;
                             int c0 = (Integer) o0.getClass()
@@ -2149,7 +2137,7 @@ public final class Hook {
                             // HyperOS：浅色背景时框架给图标下发的是**深色** tint
                             // （#bf0c0c0c 之类），tintArg() 的「够亮」条件会把它挡掉，
                             // 所以 HyperOS 走 recolor() 的完整规则；ColorOS 保持 v11.4。
-                            Integer r0 = Rom.isHyperOs() ? recolor(c0) : tintArg(c0);
+                            Integer r0 = Rom.isHyperOs() ? HyperOsTint.recolor(v, c0) : tintArg(c0);
                             if (r0 == null) return;
                             if (r0.intValue() != c0) {
                                 param.args[0] = newCsl(o0, r0.intValue());
@@ -2187,6 +2175,7 @@ public final class Hook {
             XposedBridge.hookMethod(M_SET_COLOR_FILTER, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
                     try {
+                        if (Rom.isHyperOs()) return;
                         Boolean inSb = IN_STATUS_BAR.get();
                         if (inSb == null || !inSb) return;
                         Object a0 = param.args[0];
@@ -2204,6 +2193,9 @@ public final class Hook {
             });
 
             log("hooked ImageView tint (status-bar scoped)");
+
+            // HyperOS 的 Drawable / Paint 由专用入口处理，避免对已插值的颜色二次着色。
+            if (Rom.isHyperOs()) return;
 
             // Drawable 自己的 tint —— 信号/WiFi 图标的颜色常走这条路
             Class<?> drawableCls = Class.forName("android.graphics.drawable.Drawable", false, cl);
@@ -2598,6 +2590,32 @@ public final class Hook {
         return recolor(original);
     }
 
+    private static Integer recolorView(View view, int original) {
+        if (Rom.isHyperOs()) return HyperOsTint.recolor(view, original);
+        return isNeutralColor(original) || isConfiguredColor(original) ? recolor(original) : null;
+    }
+
+    static boolean isThemeColorShared(int color) {
+        return isNeutralColor(color) || isConfiguredColor(color);
+    }
+
+    private static final android.animation.ArgbEvaluator COLOR_EVALUATOR =
+            new android.animation.ArgbEvaluator();
+
+    /** 直接按系统 darkIntensity 插值两组配置，RGB 与 alpha 都跟随原生动画。 */
+    static Integer colorAtDarkIntensityShared(float intensity) {
+        Context ctx = sCtx;
+        if (ctx == null) return null;
+        Conf conf = readConf(ctx);
+        if (conf == null || !conf.enable) return null;
+        int lightIcons = Config.applyAlpha(Config.parseColor(conf.dark, 0xFFFFFFFF), conf.alpha);
+        int darkIcons = Config.applyAlpha(Config.parseColor(conf.light, 0xFF000000), conf.alpha);
+        float f = Math.max(0f, Math.min(1f, intensity));
+        if (f == 0f) return lightIcons;
+        if (f == 1f) return darkIcons;
+        return (Integer) COLOR_EVALUATOR.evaluate(f, lightIcons, darkIcons);
+    }
+
     static void logShared(String s) {
         log(s);
     }
@@ -2611,12 +2629,6 @@ public final class Hook {
 
     static boolean inStatusBarWindowShared(View v) {
         return isInStatusBarWindow(v);
-    }
-
-    /** 最近 300ms 内发生过时钟场景翻转（切换动画期间）—— 期间合并电量烘焙。 */
-    static boolean inSceneTransitionShared() {
-        long at = sSceneAt;
-        return at > 0 && android.os.SystemClock.uptimeMillis() - at < 300;
     }
 
     static int scaleAlphaShared(int origAlpha, int cfgAlpha) {

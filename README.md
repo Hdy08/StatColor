@@ -2,12 +2,13 @@
 
 一个 LSPosed 模块，用来**统一修改 ColorOS / OxygenOS 与 HyperOS 状态栏上所有元素的颜色与透明度**（通知图标除外）。
 
-v12.0.4 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
+v12.1.1 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判断当前设备跑的是哪套 SystemUI，
 再选择对应的着色通道 —— 同一份 APK 在两类 ROM 上都能用。
 
-> v12.0.4：明暗场景切换时电量图标与其它元素**同步换色**（ColorOS 原本会跟着系统的颜色渐变
-> 慢半拍；HyperOS 的电量也可能收不到 dark 回调而一直等扫描 —— 现在以时钟换色为信号立即重刷）
-> 慢半拍，现在以时钟换色为信号立刻切组），见「场景切换的同步」。
+> v12.1.1：HyperOS 的文字、系统图标与电量共享系统颜色分发器的明暗进度和作用区域。
+> 移除电量额外的 120ms 确认与 80ms 延迟；绘制前核对填充位图是否已更新，
+> 修复边框已变色、绿色填充仍读取旧缓存的不同步路径。充电绿等系统状态色仍保留 RGB，
+> 仅透明度随同一次动画更新。详见「场景切换的同步」。
 >
 > v11.5.4 修复：两类 ROM 的电量图标在「浅色状态栏」下都会误用「深色背景」那组配置色 ——
 > HyperOS 是未充电时的电池外框，ColorOS 是**充电时**的闪电。详见下文「颜色组」。
@@ -20,7 +21,7 @@ v12.0.4 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判�
 | ROM | 机型 | 版本 |
 |---|---|---|
 | ColorOS 16 / Android 16 | OnePlus 13（PJZ110） | 上游 v1.3 ~ v11.4.3；v11.5.2 闪电颜色组、v12.0 场景同步验证 |
-| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证；v12.0.4 场景同步验证（OS3.0.8.0.VLRCNXM） |
+| HyperOS 3 / Android 15 | Xiaomi MIX Fold 2（zizhan） | v11.5.2 开发验证；v12.1.1 场景同步 / 充电填充验证（OS3.0.8.0.VLRCNXM） |
 
 作用域固定为 `com.android.systemui`（两类 ROM 的 SystemUI 都是这个包名）。
 
@@ -54,7 +55,7 @@ v12.0.4 = 上游 v11.4.3（ColorOS 通道）+ HyperOS 适配：注入时先判�
 判定结果写进日志，一眼就能确认模块走的是哪条通道：
 
 ```
-StatColor: === v12.0.4 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
+StatColor: === v12.1.1 enter com.android.systemui rom=HyperOS(OS3.0.8.0.VLRCNXM) display=AQ3A.250226.002
 StatColor: hyperos: com.android.systemui.statusbar.views.MiuiBatteryMeterView hooks=2
 ```
 
@@ -105,6 +106,8 @@ StatColor: hyperos: com.android.systemui.statusbar.views.MiuiBatteryMeterView ho
 2. `View.post()` 在子线程上只是把 Runnable 塞进那个线程的 RunQueue，**永远不会被执行** —— "延迟补色"和"挂载后复核"两版代码日志里一条都没打出来。
 
 所以改成反过来做：**周期性（80ms）从状态栏窗口根视图遍历真实视图树**，把 ImageView 的 tint / TextView 的颜色改成目标色。边界天然正确，新增图标（VPN/NFC/蓝牙）不需要加白名单。
+
+HyperOS v12.1.1 另在每次系统颜色分发结束前主动扫描；80ms 扫描只作为挂载与配置恢复的兜底。
 
 另外维护一个 `SB_ICON_VIEWS` 集合记录"已确认是状态栏图标"的 View —— 布局变化（网速文字变长把左边图标挤动）时框架会重新下发白色 tint，有了它就能**当帧**改掉，不会闪白。
 
@@ -195,8 +198,8 @@ MiuiBatteryMeterView (LinearLayout)
       ├─ onDarkChangeInternal()           ← 颜色的唯一计算点
       │    mTintBgDrawable.setTintList(...)        // 外框 + 闪电
       │    mProgressClipDrawable.setTintList(...)  // 电量填充
-      │    updateProgressBackgroundBitmap()        // 把两者烘焙成位图
-      └─ onDraw(Canvas)                   ← 只画烘焙好的位图
+      │    updateProgressBackgroundBitmap()        // 填充与裁剪烘焙成位图
+      └─ onDraw(Canvas)                   ← 画填充位图，再直接画外框 / 闪电
 ```
 
 所以适配点不是「拦截绘制参数」，而是「在它算完颜色之后改写结果」：
@@ -248,68 +251,36 @@ HyperOS 极性每次变化都会打一行日志：
 StatColor: [bar] #ff000000 from onDarkChanged 深色图标（浅色背景）→ 用「浅色背景」组
 ```
 
-#### 场景切换的同步（v12.0 ~ v12.0.4）
+#### 场景切换的同步（v12.1.1）
 
-明暗切换时，状态栏文字 / 图标是**一帧内**换完的，但 ColorOS 的电量图标会跟着系统的
-颜色过渡**渐变**过去（实测 p1/p2/p3 在约 160ms 内从 `#4D000000/#E6000000` 一路变到
-`#4CFFFFFF`）。我们的改色发生在 `draw(Canvas)` 里，于是忠实地跟着渐变走 ——
-看起来就是「其它元素都换完了，电量还在淡入」。
+HyperOS 使用 `HyperOsTint` 统一文字、系统图标和电量的着色时机。它在
+`DarkIconDispatcherImpl#applyIconTint()` 分发前取得当次 `mDarkIntensity`、
+`mUseTint` 和 `mTintAreas`，在 `addDarkReceiver` / `applyDark` 时也同步快照，
+以覆盖刚挂载的视图。分发器原有参数与接收者均保留。
 
-v12.0 用**状态栏时钟**当场景信号（它总是第一个被设成纯白/纯黑）：
+- 各视图调用系统自己的 `DarkIconDispatcher.isInAreas()` 判断所处区域；快照按显示屏分别保存，
+  不把左侧时钟的场景套到整条状态栏，也不从已经改色的文字反推背景。
+- tint 模式使用系统当次 `darkIntensity`，通过 `ArgbEvaluator` 对两组配置的 RGB 和 alpha
+  插值；非 tint 模式按 MIUI 原生规则在 `intensity > 0` 时使用深色资源对应的那组颜色。
+- 每次分发结束前补齐当前屏幕的状态栏视图树，不受常规 80ms 扫描节流影响。
+  后续由协程或数值刷新下发的旧 tint / 文字色也会映射到当前快照，避免颜色回退。
+- 电量位图生成之前摆正填充 tint；实际生成后记录颜色与尺寸。电量 `onDraw` 前核对该记录，
+  若 Drawable 已有新 tint、缓存位图却还是旧颜色，则当场重建。外框、闪电、百分比和填充
+  因而读取同一次颜色分发的结果。已匹配的位图不会仅因重复扫描而重建。
+- HyperOS 不再叠加绘制期的通用 Paint / Drawable 改色，避免把动画中间色再次判组，
+  或把已经计算好的透明度重复缩放。
 
-- `setTextColor` 钩子里，`*Clock*` 变成纯白/纯黑时记下 `sSceneP` + 时间戳
-  （锁屏时钟按类名排除，颜色语境相反）；
-- 之后 800ms（`SCENE_SYNC_MS`）内电量直接套用新场景那一组，不再按渐变中的颜色判组；
-- 其中前 300ms（`SCENE_FREEZE_MS`）把目标色**冻结**，不跟着系统的颜色动画重设 ——
-  否则电量还会淡 100ms 才到终值；
-- 窗口结束后回到逐元素判组，此时系统颜色已经稳定，不会二次跳变。
+充电绿色、低电量红、省电黄等填充继续取系统状态色的 RGB，其 alpha 与外框共享同一
+动画进度。关闭模块后，各条映射均返回不处理，恢复系统回调原有的结果。
 
-```
-StatColor: [sync] clock #bf000000 → 浅色背景组
-```
+旧版本 HyperOS 曾先等待时钟翻转持续 120ms，再把切换期间的位图重建延后 80ms。
+这种分开的时间线会带来电量滞后，v12.1.1 已移除。ColorOS 保留原有时钟信号与
+短窗口冻结逻辑，本轮没有 ColorOS 设备回归。
 
-HyperOS 还有另一个毛病（v12.0.1）：**系统经常根本不调用电量控件的 `onDarkChanged`** ——
-实测切场景后等 7 秒都没有 `[bar]` 回调，电量只能靠 80ms 的视图树扫描兜底，
-而扫描用的极性还是上一次回调留下的旧值，于是一直停在旧场景的颜色上。
-现在时钟翻转时直接改写 `sIconPolarity` 并调用 `HyperOsHooks.refreshNow()`，
-把见过的电量控件（容器 / 图标 / 空心样式）立刻重刷 + `invalidate()`：
-
-```
-StatColor: [sync] refresh 3 views p=#ffffffff
-StatColor: [sync] clock #dde1e1e1 → 深色背景组
-```
-
-还有一个更隐蔽的**偶发闪一下**（v12.0.2）：MIUI 的 dark 处理会先 `setTintList(系统色)`
-再调 `updateProgressBackgroundBitmap()` 把颜色烘焙进位图。如果这中间我们的刷新已经写好颜色，
-系统的烘焙就会把旧色压回去 —— 下一帧再被我们改回来，看起来就是「闪一下」。
-现在直接在 `updateProgressBackgroundBitmap()` / 空心样式的 `updateFirstBitmap()`、
-`updateSecondBitmap()` **之前**再摆一次 tint：不管谁触发烘焙，烘进去的永远是当前场景的颜色。
-
-最后是**短瞬态**（v12.0.3）：用户录屏里逐帧看到，切 Settings 页时状态栏会整条变白约 60~80ms
-再变回来（`[sync] clock` 连续两次反向着色）。以前电量会立刻跟过去，看起来就是「闪一下」。
-现在时钟翻转只登记为**待确认**，120ms 后才真正应用到电量；这期间时钟又翻转就重排。
-真实的明暗切换不受影响 —— 电量自己的 `onDarkChanged` 通常 30ms 内就到，会先应用；
-只有它不来时才走这条 120ms 的兜底：
-
-```
-StatColor: [sync] clock #dde1e1e1 → 深色背景组
-StatColor: [sync] apply 深色背景组（时钟确认）
-```
-
-还有一点（v12.0.4）：**模块开着时切页的闪烁比关掉更明显、更慢**。原因是系统的短瞬态会连发
-好几次相反的颜色，而我们的改色是「改 tint + 立刻烘焙位图」—— 每来一次就烘焙一次，
-等于把中间那一两帧的白色也画了出来；关掉模块时电量根本不会在这些瞬间重画。
-现在场景切换的 300ms 内**合并烘焙**：tint 照改，位图等颜色稳定 80ms 后再烘一次
-（`scheduleBake`），中间态不再落到屏幕上。真实切换不受影响（电量回调到达后 80ms 内完成）。
-
-30fps 录屏逐帧对比（时钟 vs 电量的首次变色帧）：
-
-| ROM | 切换方向 | 结果 |
-|---|---|---|
-| ColorOS | 浅 → 深 | 同一帧（v11.5.4 会延续约 5 帧的渐变） |
-| ColorOS | 深 → 浅 | 同一帧 |
-| HyperOS | 浅 ↔ 深 | 同一帧（系统回调有时完全不来，v12.0.1 起由时钟信号兜底刷新） |
-| HyperOS | 设置 ↔ 桌面 ×5 | 730 帧逐帧检查，时钟与电量场景不一致的帧数 **0** |
+实机验证：MIX Fold 2 外屏、HyperOS OS3.0.8.0.VLRCNXM / Android 15、充电状态。
+透明度对照测试使用相同 RGB 的 `#5F808080` 与 `#FF808080`，使外框和绿色填充的变化
+可以分开测量；6 次切换的首次变化均在同一录屏帧。另完成应用间切换、70ms 间隔快速切换、
+设置 / WLAN / 返回桌面切换，并恢复原配置。详见 [验证记录](docs/hyperos-sync-verification.md)。
 
 ---
 
@@ -418,7 +389,8 @@ ColorOS 的策略放过了这条路径，所以旧路径保留。`/data/system` 
 ```
 StatColor/
   src/com/statcolor/app/Hook.java        注入逻辑主体：窗口划界 / 扫描 / 文字 / Paint / 配置
-  src/com/statcolor/app/HyperOsHooks.java HyperOS 适配层：MiuiBatteryMeter* 电量
+  src/com/statcolor/app/HyperOsHooks.java HyperOS 适配层：MiuiBatteryMeter* 电量 / 位图同步
+  src/com/statcolor/app/HyperOsTint.java  HyperOS 系统颜色分发快照 / 逐视图区域与动画进度
   src/com/statcolor/app/Rom.java         ROM 识别（类探测 → 属性 → Build）
   src/com/statcolor/app/Config.java      颜色解析 / 透明度 / pref 读写
   src/com/statcolor/app/Module.java      IXposedHookLoadPackage 入口
@@ -513,17 +485,16 @@ Windows 下没有 smali/dexlib 时，可以只用 `build-tools` 里的 `aapt2 du
 
 | 标记 | 含义 |
 |---|---|
-| `=== v12.0.4 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
+| `=== v12.1.1 enter com.android.systemui rom=...` | 模块已加载并识别到 ROM（**没有这行说明模块根本没跑，后面所有现象都不必分析**） |
 | `hyperos: ... hooks=N` | HyperOS 电量相关钩子挂载数量（`MISS` 表示该类不存在，ROM 可能变了） |
 | `conf file = ...` / `conf source = ...` | 配置实际用的哪条路径（HyperOS 应为 `/data/system/statcolor.conf`） |
 | `[sweep] ...` / `[sweep-skip] ...` / `[sweep-text] ...` | 视图树扫描改色 / 因位置被跳过 / 文字改色 |
 | `[icon-tint] known-icon ...` | 快路径命中，框架重设 tint 被当帧拦下 |
 | `[text-color] ...` / `[flicker-guard] #N ...` | 文字颜色在源头被改写 / 系统试图把已改色文字打回原色（防闪烁计数） |
-| `[hyperos-batt] ... charging=... low=...` | HyperOS 电量图标的判定与目标色（`seed=` 为选组依据） |
-| `[bar] #... from ...` | 状态栏明暗极性变化，决定电量用「深色背景」还是「浅色背景」那组颜色 |
-| `[sync] clock #...` | 场景翻转（时钟换色）—— 电量随即按新场景切组并冻结 300ms，避免跟着系统渐变动画 |
-| `[sync] refresh N views` | HyperOS：场景翻转时立即重刷的电量控件数量（不等系统的 dark 回调） |
-| `[sync] apply ...（时钟确认）` | 时钟翻转持续超过 120ms 后才应用到电量（短瞬态不跟随，避免闪一下） |
+| `[hyperos-batt] ... charging=... low=...` | HyperOS 电量图标的状态及外框 / 填充目标色 |
+| `[bar] #... from ...` | 电量回调中的系统明暗极性，仅供分发器接口缺失时回退 |
+| `[sync] clock #...` | ColorOS 场景翻转；HyperOS v12.1.1 不再由时钟驱动 |
+| `[hyperos-sync] display=... intensity=... useTint=... areas=...` | HyperOS 颜色分发快照已取得；按显示屏、作用区域与原生进度同步 |
 | `[hyperos-hollow] ...` | 空心电量样式的处理 |
 | `[batt-draw] ... charging=true/false` | ColorOS 电量图标的充电判定结果 |
 | `[batt-bolt] bolt ...` | ColorOS 闪电上色 / 透明度 |
