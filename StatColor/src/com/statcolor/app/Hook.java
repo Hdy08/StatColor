@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.0.3";
+    public static final String VERSION = "12.0.4";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -2611,6 +2611,12 @@ public final class Hook {
 
     static boolean inStatusBarWindowShared(View v) {
         return isInStatusBarWindow(v);
+    }
+
+    /** 最近 300ms 内发生过时钟场景翻转（切换动画期间）—— 期间合并电量烘焙。 */
+    static boolean inSceneTransitionShared() {
+        long at = sSceneAt;
+        return at > 0 && android.os.SystemClock.uptimeMillis() - at < 300;
     }
 
     static int scaleAlphaShared(int origAlpha, int cfgAlpha) {

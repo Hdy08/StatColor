@@ -327,8 +327,17 @@ final class HyperOsHooks {
         if (changed) {
             // 颜色在 updateProgressBackgroundBitmap() 里被烘焙进位图，
             // 改完 tint 必须重建，否则要等下一次布局 / 电量变化才生效。
-            invoke(icon, "updateProgressBackgroundBitmap");
-            if (icon instanceof View) ((View) icon).invalidate();
+            //
+            // 场景切换的那 300ms 内不立刻烘焙：手势返回桌面 / 打开设置时，
+            // 系统会连着下发好几次相反的颜色（短暂态），立刻烘焙就等于把
+            // 中间那一两帧的「白」画出来 —— 模块开着比关掉更闪、更慢就是这个
+            // 原因。这里合并成一次：80ms 后颜色稳定了再烘焙。
+            if (Hook.inSceneTransitionShared()) {
+                scheduleBake(icon);
+            } else {
+                invoke(icon, "updateProgressBackgroundBitmap");
+                if (icon instanceof View) ((View) icon).invalidate();
+            }
             if (BATT_LOG.incrementAndGet() <= 12) {
                 Hook.logShared("[hyperos-batt] " + state(charging, low, save, perf)
                         + " seed=#" + hex(Hook.barSeedShared())
@@ -336,6 +345,35 @@ final class HyperOsHooks {
             }
         }
         return changed;
+    }
+
+    // ── 场景切换期间的合并烘焙 ───────────────────────────────────────────
+
+    private static final long BAKE_DELAY_MS = 80;
+
+    private static final android.os.Handler sBakeHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
+    private static final java.util.Map<Object, Runnable> PENDING_BAKE =
+            java.util.Collections.synchronizedMap(
+                    new java.util.WeakHashMap<Object, Runnable>());
+
+    /** 80ms 后再烘焙（每次都替换上一次，等于合并成一次）。 */
+    private static void scheduleBake(final Object icon) {
+        Runnable old = PENDING_BAKE.remove(icon);
+        if (old != null) sBakeHandler.removeCallbacks(old);
+        Runnable r = new Runnable() {
+            @Override public void run() {
+                try {
+                    PENDING_BAKE.remove(icon);
+                    paintIconTints(icon);                 // 用最新场景的颜色
+                    invoke(icon, "updateProgressBackgroundBitmap");
+                    if (icon instanceof View) ((View) icon).invalidate();
+                } catch (Throwable ignored) {}
+            }
+        };
+        PENDING_BAKE.put(icon, r);
+        sBakeHandler.postDelayed(r, BAKE_DELAY_MS);
     }
 
     /**
