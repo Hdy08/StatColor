@@ -45,7 +45,7 @@ public final class Hook {
 
     private static final String TAG = "StatColor";
 
-    public static final String VERSION = "12.1.1";
+    public static final String VERSION = "12.1.2";
 
     /**
      * 配置镜像文件（旧位置）。
@@ -138,6 +138,7 @@ public final class Hook {
             } else {
                 // ColorOS / OxygenOS；识别不出 ROM 时也走这里（保守回退，
                 // 类不存在时这些钩子只是打 MISS，不会误伤）
+                hookColorOsFluidDrawScope(cl);
                 hookBatteryAndDecorColor(cl);
                 // WiFi/信号 tint 与 drawable 普查是当年定位 OPLUS 类名用的探针
                 hookMobileWifiTint(cl);
@@ -290,6 +291,7 @@ public final class Hook {
             if (cn.contains("FocusedNotifPrompt")) return;   // 左侧通知提示
             if (cn.contains("Island")) return;               // 灵动岛保持系统色
         } else {
+            if (isColorOsFluidRoot(v)) return;
             // ColorOS：通知图标子树类名带 Notification，沿用它原来的规则
             if (cn.contains("Notification")) return;
         }
@@ -307,6 +309,56 @@ public final class Hook {
             ViewGroup g = (ViewGroup) v;
             int n = g.getChildCount();
             for (int i = 0; i < n && i < 64; i++) sweep(g.getChildAt(i), depth + 1);
+        }
+    }
+
+    // ───────── ColorOS 流体云：保持内容原色，包括绘制时设置的 Paint
+
+    private static boolean isColorOsFluidRoot(View v) {
+        if (v == null || Rom.isHyperOs()) return false;
+        String cn = v.getClass().getName();
+        // 宿主容器涵盖普通 TextView；插件类覆盖内容临时脱离宿主的动画阶段。
+        return cn.equals("com.oplus.systemui.statusbar.seeding.CapsulePluginContainer")
+                || cn.startsWith("com.oplus.systemui.plugins.seedling.");
+    }
+
+    private static boolean isInColorOsFluid(View v) {
+        if (Rom.isHyperOs()) return false;
+        for (int i = 0; v != null && i < 32; i++) {
+            if (isColorOsFluidRoot(v)) return true;
+            android.view.ViewParent parent = v.getParent();
+            v = parent instanceof View ? (View) parent : null;
+        }
+        return false;
+    }
+
+    private static void hookColorOsFluidDrawScope(ClassLoader cl) {
+        try {
+            Class<?> vg = Class.forName("android.view.ViewGroup", false, cl);
+            java.lang.reflect.Method drawChild = vg.getDeclaredMethod("drawChild",
+                    android.graphics.Canvas.class, View.class, long.class);
+            XposedBridge.hookMethod(drawChild, new XC_MethodHook() {
+                private final ThreadLocal<MethodHookParam> suspendedCall =
+                        new ThreadLocal<MethodHookParam>();
+
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!Boolean.TRUE.equals(IN_STATUS_BAR.get())) return;
+                    if (!isColorOsFluidRoot((View) param.args[1])) return;
+                    suspendedCall.set(param);
+                    IN_STATUS_BAR.set(Boolean.FALSE);
+                }
+
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    // 仅恢复本次暂停的范围；嵌套 drawChild 和异常退出均不会提前恢复。
+                    if (suspendedCall.get() == param) {
+                        suspendedCall.remove();
+                        IN_STATUS_BAR.set(Boolean.TRUE);
+                    }
+                }
+            });
+            log("hooked ViewGroup#drawChild (ColorOS fluid excluded)");
+        } catch (Throwable t) {
+            log("hookColorOsFluidDrawScope failed: " + t);
         }
     }
 
@@ -496,6 +548,8 @@ public final class Hook {
 
     /** 这个 TextView 是不是状态栏里的文字。 */
     private static boolean isStatusBarText(android.widget.TextView tv) {
+        // 必须先于弱引用缓存判断：动画可能把已登记的文字移进流体云。
+        if (isInColorOsFluid(tv)) return false;
         if (Rom.isHyperOs() && !isInStatusBarWindow(tv)) return false;
         if (SB_TEXT_VIEWS.contains(tv)) return true;
         if (!isInStatusBarWindow(tv)) return false;
@@ -2118,6 +2172,7 @@ public final class Hook {
                         if (!(self instanceof View)) return;
                         View v = (View) self;
                         if (SELF_APPLY.get() != null) return;
+                        if (isInColorOsFluid(v)) return;
 
                         // 通知图标走的是同一个 setImageTintList
                         // （StatusBarIconView#onDarkChanged），调用链里没有
